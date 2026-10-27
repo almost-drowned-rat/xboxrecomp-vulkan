@@ -1,0 +1,51 @@
+# Headless Linux build of the runtime and its tests (design principle A10:
+# Linux is an equal target from now on). No game data: only the toolkit.
+name: linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      SDL3_TAG: release-3.4.18
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang libvulkan-dev glslang-dev glslang-tools python3-venv
+          # The lifter's output depends on the disassembler: Ubuntu's capstone
+          # 4.0.2 lifts repe cmpsw differently from 5.0.7 (what the Windows
+          # setup installs) and a lifter test fails. Pin it.
+          python3 -m venv ~/venv
+          ~/venv/bin/pip install -q capstone==5.0.7 pytest pefile numpy
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+
+      # Ubuntu 24.04 has no SDL3 package: build the same release as
+      # tools/deps.ps1, console-only (no X11/Wayland needed headless).
+      - name: SDL3 cache
+        id: sdl3
+        uses: actions/cache@v4
+        with:
+          path: ~/sdl3
+          key: sdl3-${{ env.SDL3_TAG }}-ubuntu-24.04
+      - name: SDL3
+        if: steps.sdl3.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$SDL3_TAG" https://github.com/libsdl-org/SDL.git /tmp/sdl
+          cmake -S /tmp/sdl -B /tmp/sdl/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DSDL_UNIX_CONSOLE_BUILD=ON -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX="$HOME/sdl3"
+          cmake --build /tmp/sdl/build -j 4
+          cmake --install /tmp/sdl/build
+
+      - name: Build and test
+        run: SDL3_DIR="$HOME/sdl3" JOBS=4 bash tools/linux/ci.sh build-linux
+        env:
+          LD_LIBRARY_PATH: /home/runner/sdl3/lib
