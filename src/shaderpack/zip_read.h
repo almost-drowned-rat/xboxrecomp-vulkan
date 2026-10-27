@@ -38,6 +38,12 @@ const ZipEntry *zip_entry(const ZipFile *z, int i);
 /* The entry's bytes into out (entry->usize of them): read, inflated and
  * checked against the size and CRC-32. 1 = done, 0 = error (err). */
 int zip_extract(ZipFile *z, int i, void *out, char *err, size_t n);
+/* The entry streamed into the file at path (created or replaced), with the
+ * same checks but no ZIP_MAX_ENTRY_BYTES cap: inflated in 32 KB steps, so an
+ * entry of any size up to 4 GB needs no buffer of its size (the launcher's
+ * compiler zip has a 78 MB DLL). Stops as soon as the data runs past usize.
+ * 1 = done, 0 = error (err; a partly written file is removed). */
+int zip_extract_to_file(ZipFile *z, int i, const char *path, char *err, size_t n);
 void zip_close(ZipFile *z);
 
 /* CRC-32 (IEEE, as ZIP uses), continued from crc (0 to start). */

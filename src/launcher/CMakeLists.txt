@@ -6,6 +6,7 @@
 
 add_library(xbox_launcher STATIC
     launcher.c
+    http_get.c
     sha256.c
 )
 target_include_directories(xbox_launcher PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -13,6 +14,9 @@ if(NOT TARGET SDL3::SDL3)                 # imported targets are directory-scope
     find_package(SDL3 CONFIG REQUIRED)
 endif()
 target_link_libraries(xbox_launcher PUBLIC xbox_install_ui xbox_install xbox_shaderpack xbox_kernel SDL3::SDL3)
+if(WIN32)
+    target_link_libraries(xbox_launcher PUBLIC winhttp)   # the compiler download (http_get.c)
+endif()
 
 if(MSVC)
     target_compile_options(xbox_launcher PRIVATE /W4 /O2)

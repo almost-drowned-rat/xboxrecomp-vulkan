@@ -481,3 +481,17 @@ new one at the milestone it was found. Workflow: [porting_guide.md](porting_guid
 - **Test without taking the desktop:** keys go to the game window with PostMessage(WM_KEYDOWN) - no focus change
   (used to prove the boot animation ignores them: it cannot be skipped, maintainer 2026-10-27); captures with PrintWindow (the window's own content - CopyFromScreen had caught other windows on
   top, the maintainer's screen among them).
+
+### No system tools, no connectivity pre-checks on the first-start path (`src/launcher`, release v0.9.1)
+- **What happened (v0.9.0 testers, Linux with Proton / Wine, the Windows build):** the launcher said "no internet?"
+  while fetching llvm-mingw, and unpacking the compiler then failed because it wanted `tar.exe`. The launcher had run
+  Windows' own `System32\curl.exe` and `tar.exe` (there since Windows 10 1803): Wine has neither, so the process
+  could not start and the guessed message blamed the network.
+- **Rule (maintainer, 2026-10-27; every port's release):** shipped code calls **no external system tools**
+  (curl, tar, powershell, certutil, cmd ...) - only programs we ship or download ourselves; and **never asks "is the
+  network up"** before a download (Wine's answers to those APIs are often wrong) - it tries and reports the real error
+  class (DNS / connect / TLS / HTTP status, `http_get.c`) with *Retry*. Download in-process with WinHTTP (on Wine it
+  maps to the host's GnuTLS and CA store); unpack in-process with our zip reader, **streamed**
+  (`zip_extract_to_file`): the 64 MB in-memory cap of `zip_extract` is for shader packs, libLLVM-23.dll alone is 78 MB.
+- **A message must not guess:** "no internet?" was a guess from a failed process start. Carry the real cause up to
+  the box (and into `data\launcher.log`).

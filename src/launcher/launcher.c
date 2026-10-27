@@ -3,6 +3,7 @@
 #include "launcher.h"
 
 #include "game_setup_ui.h"
+#include "http_get.h"
 #include "sha256.h"
 #include "zip_read.h"
 
@@ -202,18 +203,6 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
     if (out)
         SDL_CloseIO(out);
     return code;
-}
-
-/* Windows' own tools (curl.exe, tar.exe - in every Windows 10 1803+ / 11) */
-static void sys_tool(char *out, size_t n, const char *exe)
-{
-    const char *sr = SDL_getenv("SystemRoot");
-#if defined(SDL_PLATFORM_WINDOWS)
-    snprintf(out, n, "%s\\System32\\%s.exe", sr ? sr : "C:\\Windows", exe);
-#else
-    (void)sr;
-    snprintf(out, n, "%s", exe);
-#endif
 }
 
 /* ── a step on a worker thread, the window kept alive meanwhile ────────── */
@@ -563,9 +552,16 @@ static int unpack_job(L *l, void *a)
 
 /* ── 4. the compiler ───────────────────────────────────────────────────── */
 
+/* Only our own code on the first-start path: no system tools (curl.exe, tar.exe, powershell - Wine / Proton have
+ * none of them) and no "is the network up" check (Wine answers it wrongly): the download is tried, the real error
+ * shown (http_get.h), the zip unpacked with the toolkit's reader. */
 typedef struct {
     char url[LP], sha[65], folder[256], zip[LP];
     Sint64 size;
+    SDL_AtomicInt got;                  /* bytes downloaded (the progress bar) */
+    int cls;                            /* the last download's XR_HTTP_* class */
+    char err[512];                      /* its message */
+    Prog unpack;                        /* entries unpacked */
 } Toolchain;
 
 static int read_toolchain(L *l, Toolchain *t)
@@ -621,18 +617,24 @@ static int file_sha256(const char *p, char hex[65])
 static double dl_frac(void *a)
 {
     Toolchain *t = (Toolchain *)a;
-    Sint64 n = file_size(t->zip);
+    int n = SDL_GetAtomicInt(&t->got);
     return t->size > 0 && n > 0 ? (double)n / (double)t->size : 0.0;
 }
 
+/* three tries for what may pass (DNS, connect, a dropped transfer); TLS, HTTP status and the disk do not change */
 static int download_job(L *l, void *a)
 {
     Toolchain *t = (Toolchain *)a;
-    char curl[LP], logp[LP];
-    char *argv[] = { curl, "-L", "--fail", "--retry", "3", "-sS", "-o", t->zip, t->url, NULL };
-    sys_tool(curl, sizeof curl, "curl");
-    join(logp, sizeof logp, l->data, "launcher_download.log");
-    return run_proc(l, argv, NULL, logp) == 0 ? 0 : 1;
+    int i;
+    for (i = 1; i <= 3; i++) {
+        t->cls = xr_http_get_file(t->url, t->zip, &t->got, t->err, sizeof t->err);
+        lg(l, "compiler download, try %d: %s - %s", i, xr_http_class_name(t->cls), t->err);
+        if (t->cls != XR_HTTP_DNS && t->cls != XR_HTTP_CONNECT && t->cls != XR_HTTP_OTHER)
+            break;
+        if (i < 3)
+            SDL_Delay(2000u * (unsigned)i);
+    }
+    return t->cls == XR_HTTP_OK ? 0 : 1;
 }
 
 static int check_job(L *l, void *a)
@@ -645,18 +647,54 @@ static int check_job(L *l, void *a)
     return SDL_strcasecmp(hex, t->sha) ? 2 : 0;
 }
 
+static double unpack_frac(void *a)
+{
+    return prog_frac(&((Toolchain *)a)->unpack);
+}
+
+/* the zip into tools/download/unpack (every entry through the zip-slip guard, streamed: libLLVM is 78 MB) */
 static int unpack_tc_job(L *l, void *a)
 {
     Toolchain *t = (Toolchain *)a;
-    char tar[LP], tmp[LP], from[LP], to[LP], logp[LP], marker[LP];
-    char *argv[] = { tar, "-xf", t->zip, "-C", tmp, NULL };
-    sys_tool(tar, sizeof tar, "tar");
+    char tmp[LP], from[LP], to[LP], marker[LP], err[256];
+    ZipFile *z;
+    int i, bad = 0;
     join(tmp, sizeof tmp, l->tools, "download/unpack");
     rm_tree(tmp);
     SDL_CreateDirectory(tmp);
-    join(logp, sizeof logp, l->data, "launcher_download.log");
-    if (run_proc(l, argv, NULL, logp) != 0)
+    if (!(z = zip_open(t->zip, err, sizeof err))) {
+        lg(l, "compiler zip: %s", err);
         return 1;
+    }
+    t->unpack.total = zip_count(z);
+    for (i = 0; i < zip_count(z) && !bad; i++) {
+        const ZipEntry *e = zip_entry(z, i);
+        char rel[LP], dst[LP], *slash;
+        if (!zip_safe_path(e->name, rel, sizeof rel)) {
+            lg(l, "compiler zip: refused entry %s", e->name);
+            bad = 1;
+            break;
+        }
+        join(dst, sizeof dst, tmp, rel);
+        if (e->dir) {
+            SDL_CreateDirectory(dst);
+        } else {
+            if ((slash = strrchr(dst, '/')) != NULL) {
+                *slash = 0;
+                SDL_CreateDirectory(dst);   /* creates the parents too */
+                *slash = '/';
+            }
+            if (!zip_extract_to_file(z, i, dst, err, sizeof err)) {
+                lg(l, "compiler zip: %s: %s", e->name, err);
+                bad = 1;
+            }
+        }
+        SDL_AddAtomicInt(&t->unpack.done_n, 1);
+    }
+    zip_close(z);
+    if (bad)
+        return 1;
+    lg(l, "compiler zip: %d entries unpacked", t->unpack.total);
     join(from, sizeof from, tmp, t->folder);
     join(to, sizeof to, l->tools, "llvm-mingw");
     rm_tree(to);
@@ -668,6 +706,26 @@ static int unpack_tc_job(L *l, void *a)
     SDL_RemovePath(t->zip);             /* 190 MB the player does not need any more (a repair fetches it again) */
     join(marker, sizeof marker, to, ".sha256");
     return write_text(marker, t->sha) ? 0 : 1;
+}
+
+/* an error with Retry / Quit; 1 = retry (never with RECOMP_NO_DIALOGS: the log has the message) */
+static int retry_dialog(L *l, const char *msg)
+{
+    const SDL_MessageBoxButtonData b[] = {
+        { SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Retry" },
+        { SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "Quit" },
+    };
+    SDL_MessageBoxData d;
+    int id = 0;
+    if (xr_no_dialogs())
+        return 0;
+    memset(&d, 0, sizeof d);
+    d.flags = SDL_MESSAGEBOX_ERROR | SDL_MESSAGEBOX_BUTTONS_LEFT_TO_RIGHT;
+    d.title = l->cfg->window_title;
+    d.message = msg;
+    d.numbuttons = 2;
+    d.buttons = b;
+    return SDL_ShowMessageBox(&d, &id) && id == 1;
 }
 
 static int ensure_toolchain(L *l)
@@ -688,25 +746,28 @@ static int ensure_toolchain(L *l)
     }
     SDL_free(have);
     if (file_size(t.zip) != t.size || run_job(l, "Checking the compiler download", 0.10, 0.02, check_job, &t, NULL)) {
-        SDL_RemovePath(t.zip);
-        rc = run_job(l, "Downloading the compiler (llvm-mingw, once)", 0.10, 0.15, download_job, &t, dl_frac);
-        if (rc == 0)
-            rc = run_job(l, "Checking the compiler download", 0.25, 0.01, check_job, &t, NULL);
-        if (rc) {
+        for (;;) {
             char msg[2048];
             SDL_RemovePath(t.zip);
+            rc = run_job(l, "Downloading the compiler (llvm-mingw, once)", 0.10, 0.15, download_job, &t, dl_frac);
+            if (rc == 0)
+                rc = run_job(l, "Checking the compiler download", 0.25, 0.01, check_job, &t, NULL);
+            if (rc == 0)
+                break;
+            SDL_RemovePath(t.zip);
             if (rc == 2)
-                snprintf(msg, sizeof msg, "The compiler download is damaged (its SHA-256 does not match). Start "
-                                          "again to download it once more.");
+                snprintf(msg, sizeof msg, "The compiler download is damaged (its SHA-256 does not match).\n\n"
+                                          "Retry to download it once more.");
             else
-                snprintf(msg, sizeof msg, "The compiler could not be downloaded (no internet?).\n\nDownload it by "
-                                          "hand:\n%s\n\nand put the file as it is into:\n%s\n\nthen start again.",
-                         t.url, t.zip);
-            xr_setup_ui_message(l->ui, 1, msg);
-            return 0;
+                snprintf(msg, sizeof msg, "The compiler could not be downloaded:\n%s\n\nRetry - or download it by "
+                                          "hand:\n%s\n\nput the file as it is into:\n%s\n\nand start again.",
+                         t.err, t.url, t.zip);
+            lg(l, "%s", msg);
+            if (!retry_dialog(l, msg))
+                return 0;
         }
     }
-    if (run_job(l, "Unpacking the compiler", 0.26, 0.04, unpack_tc_job, &t, NULL)) {
+    if (run_job(l, "Unpacking the compiler", 0.26, 0.04, unpack_tc_job, &t, unpack_frac)) {
         xr_setup_ui_message(l->ui, 1, "The compiler could not be unpacked - see data\\launcher.log.");
         return 0;
     }

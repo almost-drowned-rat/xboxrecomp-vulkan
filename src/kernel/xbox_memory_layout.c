@@ -2501,14 +2501,50 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * addresses upward until we find a free region.
      */
     {
-        static const uintptr_t try_bases[] = {
+        uintptr_t try_bases[] = {
             XBOX_BASE_ADDRESS,      /* 0x00010000 - original Xbox address */
+            0,                      /* a free 4 GB guest window (below, Win32) */
             0x00800000,             /* 8 MB - above typical PEB/TEB region */
             0x01000000,             /* 16 MB */
             0x02000000,             /* 32 MB */
             0x10000000,             /* 256 MB */
             0,                      /* sentinel - let OS choose */
         };
+#if defined(_WIN32)
+        /* When the original base is taken, the next try is a host range where
+         * the WHOLE 4 GB guest window is free -- not only RAM. The fixed bases
+         * below only check the 64 MB base view, and every later view (mirrors,
+         * contiguous window, tiled aperture, device apertures) sits at its own
+         * fixed distance from it. Under Wine / Proton 0x10000 is taken (the
+         * loader's own allocations), 0x10000000 was used, and two of those
+         * distances landed on Wine's own memory: mirror 27 on host 0x7C000000
+         * (the fixed shared-data page 0x7FFE0000 is in it) and the tiled
+         * aperture on host 0x100000000 -- error 487, and the title screen,
+         * which renders through 0xF0000000, killed the process (v0.9.1 tester,
+         * Arch + Wine, 2026-10-27).
+         *
+         * Reserve 4 GB top-down, note where, release it: the views below map
+         * into it one by one. Win32 cannot keep a reservation and map into it
+         * without placeholders (VirtualAlloc2, see above), so this is a probe,
+         * not a hold; top-down keeps the host's bottom-up allocations (heaps,
+         * thread stacks) away from it until the views are in place. Windows
+         * itself normally gets 0x10000 and never comes here;
+         * RECOMP_MEM_BASE=high skips the original base, to test this path. */
+        {
+            const char *mb = getenv("RECOMP_MEM_BASE");
+            void *probe = VirtualAlloc(NULL, (SIZE_T)1 << 32, MEM_RESERVE | MEM_TOP_DOWN, PAGE_NOACCESS);
+            if (probe) {
+                VirtualFree(probe, 0, MEM_RELEASE);
+                try_bases[1] = (uintptr_t)probe;
+            }
+            if (mb && !strcmp(mb, "high") && try_bases[1]) {
+                try_bases[0] = try_bases[1];
+                fprintf(stderr, "  RECOMP_MEM_BASE=high: the original base skipped\n");
+            }
+            if (try_bases[1])
+                fprintf(stderr, "  Guest window probe: 4 GB free at %p\n", probe);
+        }
+#endif
 
         /* Iterate the whole array, sentinel included. The old condition
          * (try_bases[i] != 0 || i == 0) stopped *at* the zero rather than
@@ -2554,6 +2590,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
+            if (i == 1 && !try_bases[1])
+                continue;               /* no probed window: not "let the OS choose" yet */
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,

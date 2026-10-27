@@ -194,6 +194,130 @@ int zip_extract(ZipFile *z, int i, void *out, char *err, size_t n)
     return ok;
 }
 
+#define ZIP_STREAM_IN (256u << 10)
+
+/* the stream of one entry: sequential reads from its data, inflate into the 32 KB window, every byte written + CRC'd */
+static int stream_entry(ZipFile *z, const ZipEntry *e, uint64_t data, SDL_IOStream *out, char *err, size_t n)
+{
+    uint8_t *ib = malloc(ZIP_STREAM_IN), *dict = NULL;
+    tinfl_decompressor *d = NULL;
+    uint64_t left = e->csize, total = 0;
+    uint32_t crc = 0;
+    size_t ilen = 0, ipos = 0, dpos = 0;
+    int ok = 0;
+
+    if (!ib || SDL_SeekIO(z->io, (Sint64)data, SDL_IO_SEEK_SET) != (Sint64)data) {
+        fail(err, n, ib ? "cannot read the entry" : "out of memory");
+        goto done;
+    }
+    if (e->method == 0) {
+        while (left) {
+            size_t k = left > ZIP_STREAM_IN ? ZIP_STREAM_IN : (size_t)left;
+            if (SDL_ReadIO(z->io, ib, k) != k) {
+                fail(err, n, "cannot read the entry");
+                goto done;
+            }
+            if (SDL_WriteIO(out, ib, k) != k) {
+                fail(err, n, "cannot write the file");
+                goto done;
+            }
+            crc = zip_crc32(crc, ib, k);
+            left -= k;
+            total += k;
+        }
+    } else {
+        dict = malloc(TINFL_LZ_DICT_SIZE);
+        d = malloc(sizeof *d);
+        if (!dict || !d) {
+            fail(err, n, "out of memory");
+            goto done;
+        }
+        tinfl_init(d);
+        for (;;) {
+            size_t in_n, out_n;
+            tinfl_status st;
+            if (ipos == ilen && left) {
+                ilen = left > ZIP_STREAM_IN ? ZIP_STREAM_IN : (size_t)left;
+                if (SDL_ReadIO(z->io, ib, ilen) != ilen) {
+                    fail(err, n, "cannot read the entry");
+                    goto done;
+                }
+                ipos = 0;
+                left -= ilen;
+            }
+            in_n = ilen - ipos;
+            out_n = TINFL_LZ_DICT_SIZE - dpos;
+            /* raw deflate (no zlib header) into the wrapping window */
+            st = tinfl_decompress(d, ib + ipos, &in_n, dict, dict + dpos, &out_n, left ? TINFL_FLAG_HAS_MORE_INPUT : 0);
+            ipos += in_n;
+            if (out_n) {
+                total += out_n;
+                if (total > e->usize) {
+                    fail(err, n, "inflate gives more than the entry's size (broken data)");
+                    goto done;
+                }
+                if (SDL_WriteIO(out, dict + dpos, out_n) != out_n) {
+                    fail(err, n, "cannot write the file");
+                    goto done;
+                }
+                crc = zip_crc32(crc, dict + dpos, out_n);
+                dpos = (dpos + out_n) & (TINFL_LZ_DICT_SIZE - 1);
+            }
+            if (st == TINFL_STATUS_DONE)
+                break;
+            if (st < 0 || (st == TINFL_STATUS_NEEDS_MORE_INPUT && ipos == ilen && !left)) {
+                fail(err, n, "inflate failed (broken data)");
+                goto done;
+            }
+        }
+    }
+    if (total != e->usize) {
+        fail(err, n, "inflate gives less than the entry's size (broken data)");
+        goto done;
+    }
+    if (crc != e->crc) {
+        fail(err, n, "CRC-32 mismatch (broken data)");
+        goto done;
+    }
+    ok = 1;
+done:
+    free(ib);
+    free(dict);
+    free(d);
+    return ok;
+}
+
+int zip_extract_to_file(ZipFile *z, int i, const char *path, char *err, size_t n)
+{
+    const ZipEntry *e = zip_entry(z, i);
+    uint8_t lh[30];
+    uint64_t data;
+    SDL_IOStream *out;
+    int ok;
+
+    if (!e)
+        return fail(err, n, "no such entry");
+    if (e->flags & 1)
+        return fail(err, n, "encrypted entry");
+    if (e->method != 0 && e->method != 8)
+        return fail(err, n, "compression method not supported (only stored and deflate)");
+    if (e->method == 0 && e->csize != e->usize)
+        return fail(err, n, "stored entry with two sizes");
+    if (!read_at(z->io, e->local_ofs, lh, sizeof lh) || rd32(lh) != 0x04034b50u)
+        return fail(err, n, "broken local header");
+    data = (uint64_t)e->local_ofs + 30 + rd16(lh + 26) + rd16(lh + 28);
+    if (data + e->csize > (uint64_t)SDL_GetIOSize(z->io))
+        return fail(err, n, "entry data outside the file (truncated?)");
+    if (!(out = SDL_IOFromFile(path, "wb")))
+        return fail(err, n, "cannot create the file");
+    ok = stream_entry(z, e, data, out, err, n);
+    if (!SDL_CloseIO(out) && ok)
+        ok = fail(err, n, "cannot write the file");
+    if (!ok)
+        SDL_RemovePath(path);
+    return ok;
+}
+
 void zip_close(ZipFile *z)
 {
     int k;
