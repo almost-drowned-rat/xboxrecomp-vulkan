@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "platform/host_wait.h"
+#include "frame_time.h"           /* xbox_ft_vblank_wait: flip waits in the renderer's lines */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -939,7 +940,12 @@ void xbox_GuestFlipWait(void)
     }
     now = host_now_ns() - s_vb_t0_ns;
     next = (now / (uint64_t)p + 1) * (uint64_t)p;
-    sleep_ns(next - now);
+    {
+        long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;
+        sleep_ns(next - now);
+        if (t0)                                    /* the renderer's lines: game time spent waiting */
+            xbox_ft_vblank_wait(xbox_ft_ms(t0));   /* as slept, oversleeping included */
+    }
     counter_mirrors_tick();
 }
 
@@ -954,9 +960,12 @@ void xbox_GuestSleepNs(uint64_t ns)
 
 void xbox_GuestYield(void)
 {
+    long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;
     InterlockedIncrement(&s_waits_yield);
     wait_stats();
     sleep_ns(100000);   /* 0.1 ms */
+    if (t0)
+        xbox_ft_vblank_wait(xbox_ft_ms(t0));       /* the title's throttle loop: waiting for a flip */
 }
 
 /*
@@ -2445,6 +2454,54 @@ static LONG CALLBACK null_guard_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;   /* the host's crash handler reports the rest */
 }
 
+#if defined(_WIN32)
+/* Is host [lo, lo + size) free address space (nothing reserved or mapped)? */
+static int host_range_free(uintptr_t lo, uint64_t size)
+{
+    uint64_t p = lo, end = (uint64_t)lo + size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery((LPCVOID)(uintptr_t)p, &mbi, sizeof mbi) || mbi.State != MEM_FREE)
+            return 0;
+        p = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return 1;
+}
+
+/* Every view after the base sits at a fixed distance from it, so a base is only
+ * good when all of those host ranges are free too. Checked before a base is
+ * kept: a view that fails later leaves the title in a state known to crash --
+ * v0.9.x under Wine on Arch: base 0x10000000, mirror 27 on host 0x7C000000 and
+ * the tiled aperture both error 487, death right after the intro.
+ * Returns the guest address of the first taken range, or 0 when all are free.
+ * essential: only the views a title cannot run without (the contiguous window,
+ * the tiled aperture, the NV2A registers), not the RAM wrap mirrors. */
+static uint32_t layout_window_taken(uintptr_t base, int essential)
+{
+    struct { uint32_t va; uint64_t size; } r[5 + XBOX_NUM_MIRRORS];
+    uint64_t tiled_lo = XBOX_TILED_BASE, tiled_hi = tiled_lo + xbox_TiledApertureSize();
+    int n = 0, m;
+
+    r[n].va = XBOX_CONTIG_BASE;  r[n++].size = XBOX_CONTIG_SIZE;
+    r[n].va = XBOX_TILED_BASE;   r[n++].size = xbox_TiledApertureSize();
+    r[n].va = XBOX_NV2A_BASE;    r[n++].size = XBOX_NV2A_SIZE;
+    if (!essential) {
+        r[n].va = XBOX_MCPX_BASE;  r[n++].size = XBOX_MCPX_SIZE;
+        r[n].va = XBOX_FLASH_BASE; r[n++].size = XBOX_FLASH_SIZE;
+        for (m = 0; m < XBOX_NUM_MIRRORS; m++) {
+            uint64_t lo = (uint64_t)(m + 1) * g_memory_size;
+            if (lo < tiled_hi && tiled_lo < lo + g_memory_size)
+                continue;               /* skipped by the mirror loop as well */
+            r[n].va = (uint32_t)lo;    r[n++].size = g_memory_size;
+        }
+    }
+    for (m = 0; m < n; m++)
+        if (!host_range_free(base - XBOX_MAP_START + r[m].va, r[m].size))
+            return r[m].va;
+    return 0;
+}
+#endif
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
@@ -2541,6 +2598,29 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 try_bases[0] = try_bases[1];
                 fprintf(stderr, "  RECOMP_MEM_BASE=high: the original base skipped\n");
             }
+            /* Tests for the fallback on Windows (Wine's layout, v0.9.2):
+             * RECOMP_MEM_BASE=fixed drops the probed window (the v0.9.1 order),
+             * RECOMP_MEM_BLOCK=<hex addr>[:<MB>],... reserves host ranges first
+             * (default 64 MB each), as Wine's own memory would sit there. */
+            if (mb && !strcmp(mb, "fixed")) {
+                try_bases[1] = 0;
+                fprintf(stderr, "  RECOMP_MEM_BASE=fixed: no probed window\n");
+            }
+            {
+                const char *bl = getenv("RECOMP_MEM_BLOCK");
+                while (bl && *bl) {
+                    char *end;
+                    unsigned long long a = strtoull(bl, &end, 16), mbs = 64;
+                    if (*end == ':')
+                        mbs = strtoull(end + 1, &end, 10);
+                    if (end == bl)
+                        break;
+                    fprintf(stderr, "  RECOMP_MEM_BLOCK: host 0x%llX + %llu MB %s\n", a, mbs,
+                            VirtualAlloc((LPVOID)(uintptr_t)a, (SIZE_T)(mbs << 20), MEM_RESERVE,
+                                         PAGE_NOACCESS) ? "reserved" : "NOT reserved");
+                    bl = *end == ',' ? end + 1 : end;
+                }
+            }
             if (try_bases[1])
                 fprintf(stderr, "  Guest window probe: 4 GB free at %p\n", probe);
         }
@@ -2588,6 +2668,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 #endif
 
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
+        /* Win32: pass 0 keeps a base only when every later view's range is
+         * free (layout_window_taken), pass 1 settles for the essential views;
+         * no base passing either is a clear start failure, not a crash later. */
+#if defined(_WIN32)
+        for (int pass = 0; !g_memory_base && pass < 2; pass++)
+#else
+        for (int pass = 0; pass < 1; pass++)
+#endif
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             if (i == 1 && !try_bases[1])
@@ -2606,13 +2694,29 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     g_memory_base = NULL;
                     continue;
                 }
+#if defined(_WIN32)
+                {
+                    uint32_t taken = layout_window_taken((uintptr_t)g_memory_base, pass);
+                    if (taken) {
+                        fprintf(stderr, "  Base %p rejected%s: guest 0x%08X would land on"
+                                " host memory already in use (host %p)\n",
+                                g_memory_base, pass ? " (essential views)" : "", taken,
+                                (void *)((uintptr_t)g_memory_base - XBOX_MAP_START + taken));
+                        UnmapViewOfFile(g_memory_base);
+                        g_memory_base = NULL;
+                        continue;
+                    }
+                }
+#endif
                 break;
             }
         }
     }
 
     if (!g_memory_base) {
-        fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)\n",
+        fprintf(stderr, "xbox_MemoryLayoutInit: failed to map base view (%zu KB)"
+                " -- no host address range holds the Xbox address space"
+                " (under Wine / Proton: other memory in the way, see the log above)\n",
                 g_memory_size / 1024);
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
@@ -3100,9 +3204,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
         } else {
-            fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
-                    "(error %lu); pinned physical allocations will fault\n",
+            /* Essential: the kernel page and every GPU surface live here. */
+            fprintf(stderr, "xbox_MemoryLayoutInit: contiguous window at 0x%08X failed "
+                    "(error %lu) -- stopping here instead of faulting later\n",
                     XBOX_CONTIG_BASE, GetLastError());
+            return FALSE;
         }
     }
 
@@ -3143,9 +3249,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "0x%08X (zeroed, no register semantics)\n",
                     XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
         } else {
-            fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "
-                    "(error %lu); D3D register access will fault\n",
+            fprintf(stderr, "xbox_MemoryLayoutInit: NV2A aperture at 0x%08X failed "
+                    "(error %lu) -- D3D register access would fault; stopping here\n",
                     XBOX_NV2A_BASE, GetLastError());
+            return FALSE;
         }
     }
 
@@ -3478,9 +3585,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     (unsigned)(g_memory_size / (1024 * 1024)),
                     XBOX_TILED_BASE);
         } else {
-            fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
-                    " (error %lu); rendering writes will fault\n",
+            /* Essential: titles render through it (v0.9.x Wine crash after the intro). */
+            fprintf(stderr, "xbox_MemoryLayoutInit: tiled aperture at 0x%08X failed"
+                    " (error %lu) -- rendering writes would fault; stopping here\n",
                     XBOX_TILED_BASE, GetLastError());
+            return FALSE;
         }
     }
 

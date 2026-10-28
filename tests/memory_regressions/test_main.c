@@ -8,9 +8,11 @@
  *
  * One process per mode, because the switches are read once:
  *
- *   default       No switch set. Pins what every title gets today, so a change
- *                 that alters the default shows up here.
- *   heap-reclaim  RECOMP_HEAP_RECLAIM=1. Each check fails without the fix:
+ *   reclaim-off   RECOMP_HEAP_RECLAIM=0 (was "default" until reclaim became
+ *                 the default in 6e489a6): pins the off switch - reuse hands a
+ *                 freed block over whole, contiguous memory is never reused.
+ *   heap-reclaim  RECOMP_HEAP_RECLAIM=1, what every title gets by default.
+ *                 Each check fails without the fix:
  *
  *   1. A small request after a large free takes only what it needs. Reuse used
  *      to hand over the whole block, so a 16-byte request could take 2 MB.
@@ -23,7 +25,7 @@
  *   5. MEM_DECOMMIT then MEM_COMMIT on heap memory gives zeroed pages, as on
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
- *      request of that size reuses it; the default keeps the bump allocator.
+ *      request of that size reuses it; reclaim-off keeps the bump allocator.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -175,7 +177,7 @@ static void set_env(const char *name, const char *value)
 
 int main(int argc, char **argv)
 {
-    const char *mode = argc > 1 ? argv[1] : "default";
+    const char *mode = argc > 1 ? argv[1] : "heap-reclaim";
     const char *path = argc > 2 ? argv[2] : "tools/conformance/test.xbe";
     int reclaim = !strcmp(mode, "heap-reclaim");
     int ext128 = !strcmp(mode, "ext-vma-128");
@@ -186,12 +188,18 @@ int main(int argc, char **argv)
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !ext && strcmp(mode, "default")) {
+    /* reclaim-off: the old "default" mode. Reclaim has been the runtime's
+     * default since 6e489a6 (2026-10-17); this mode kept checking "freed
+     * memory is never reused" without turning reclaim off, and failed on the
+     * Linux CI from that day on. It now asks for the off switch it tests. */
+    if (!reclaim && !ext && strcmp(mode, "reclaim-off")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
     if (reclaim)
         set_env("RECOMP_HEAP_RECLAIM", "1");
+    if (!reclaim && !ext)
+        set_env("RECOMP_HEAP_RECLAIM", "0");
     if (ext)
         set_env("RECOMP_EXT_VMA", "1");
     if (ext128)
@@ -241,9 +249,9 @@ int main(int argc, char **argv)
         } else {
             snprintf(d, sizeof d, "block is %u bytes", xbox_HeapBlockSize(s1));
             check(s1 == a && xbox_HeapBlockSize(s1) == big,
-                  "default: reuse hands over the whole freed block", d);
+                  "reclaim off: reuse hands over the whole freed block", d);
             check(s2 < a || s2 >= a + big,
-                  "default: the second request cannot share it", NULL);
+                  "reclaim off: the second request cannot share it", NULL);
         }
     }
 
@@ -312,7 +320,7 @@ int main(int argc, char **argv)
             snprintf(d2, sizeof d2, "%s, got 0x%08X, expected 0x%08X", d, c2, c1);
             check(c1 && c2 == c1, "a freed contiguous block is reused", d2);
         } else {
-            check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
+            check(c1 && c2 != c1, "reclaim off: contiguous memory is never reused", d);
         }
     }
 
@@ -328,7 +336,7 @@ int main(int argc, char **argv)
             base = hi; size = 0x100000;
             st = nt_alloc_at(&base, &size, 0x2000);
             snprintf(d, sizeof d, "status 0x%08X, base 0x%08X", st, base);
-            check(base != hi, "default: an explicit high base is not honoured", d);
+            check(base != hi, "without RECOMP_EXT_VMA: an explicit high base is not honoured", d);
         } else if (ext) {
             /* Reserve the exact address. */
             base = hi; size = 0x100000;

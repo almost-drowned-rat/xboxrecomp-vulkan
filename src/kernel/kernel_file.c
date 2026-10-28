@@ -17,6 +17,7 @@
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "frame_time.h"           /* xbox_ft_io: file reads in the [hitch] lines */
 #include <string.h>
 #include <stdio.h>
 
@@ -432,6 +433,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
+    long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;   /* the renderer's [hitch] lines */
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
@@ -448,6 +450,8 @@ NTSTATUS __stdcall xbox_NtReadFile(
     } else {
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
+    if (t0)
+        xbox_ft_io(xbox_ft_ms(t0));
 
     if (result || GetLastError() == ERROR_HANDLE_EOF) {
         IoStatusBlock->Information = bytes_read;
@@ -669,9 +673,17 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             FILE_DISPOSITION_INFO fdi;
             fdi.DeleteFile = info->DeleteFile;
             shadow_mark_delete(FileHandle, info->DeleteFile != 0);
-            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                         "SetFileDispositionInfo failed: err=%u", GetLastError());
+            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi))) {
+                /* stderr: a delete the title believes done (its save folder
+                 * still there) surfaces far away as "memory unit removed"
+                 * (v0.9.x under Wine: ERROR_DIR_NOT_EMPTY, see DIR_BY_HANDLE). */
+                WCHAR p[XBOX_HOST_PATH];
+                DWORD err = GetLastError();
+                if (!GetFinalPathNameByHandleW(FileHandle, p, XBOX_HOST_PATH, VOLUME_NAME_DOS))
+                    wcscpy_s(p, XBOX_HOST_PATH, L"?");
+                fprintf(stderr, "  [FILE] delete-on-close refused by the host: %S (err=%lu)\n",
+                        p, (unsigned long)err);
+            }
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -781,10 +793,98 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 #define MAX_DIR_CONTEXTS 64
 typedef struct {
     HANDLE file_handle;
-    HANDLE find_handle;
+    HANDLE find_handle;          /* FindFirstFileW's, or DIR_BY_HANDLE */
     BOOL   first_done;
     WIN32_FIND_DATAW find_data;
+    WIN32_FIND_DATAW *list;      /* DIR_BY_HANDLE: the whole listing */
+    int    list_n, list_i;
 } DIR_CONTEXT;
+
+/* FindFirstFileW opens the folder a second time, by path. Wine refuses that
+ * with ERROR_SHARING_VIOLATION while the title holds the folder open with a
+ * share mode NTFS lets a listing through (THPS 2X deleting a save: the
+ * listing came back empty, nothing was deleted, and every later save said
+ * "the memory unit was removed during use" -- v0.9.x on Steam Deck / Proton,
+ * reproduced under Wine 9.0). Then the listing is read through the title's
+ * own handle instead. */
+#define DIR_BY_HANDLE ((HANDLE)(intptr_t)-2)
+
+static int dir_wild_match(const WCHAR *pat, const WCHAR *s)
+{
+    if (!*pat) return !*s;
+    if (*pat == L'*') return dir_wild_match(pat + 1, s) || (*s && dir_wild_match(pat, s + 1));
+    if (!*s) return 0;
+    if (*pat != L'?' && towlower(*pat) != towlower(*s)) return 0;
+    return dir_wild_match(pat + 1, s + 1);
+}
+
+/* The listing of the folder open at h, entries matching pat. 0 = nothing read. */
+static int dir_list_by_handle(DIR_CONTEXT *ctx, HANDLE h, const WCHAR *pat)
+{
+    enum { BUF = 64 * 1024 };
+    BYTE *buf = malloc(BUF);            /* per call: titles list from several threads */
+    FILE_INFO_BY_HANDLE_CLASS cls = FileFullDirectoryRestartInfo;
+    int cap = 0;
+
+    ctx->list_n = ctx->list_i = 0;
+    while (buf && GetFileInformationByHandleEx(h, cls, buf, BUF)) {
+        FILE_FULL_DIR_INFO *e = (FILE_FULL_DIR_INFO *)buf;
+        cls = FileFullDirectoryInfo;
+        for (;;) {
+            WIN32_FIND_DATAW fd;
+            size_t n = e->FileNameLength / sizeof(WCHAR);
+            memset(&fd, 0, sizeof fd);
+            if (n >= MAX_PATH) n = MAX_PATH - 1;
+            memcpy(fd.cFileName, e->FileName, n * sizeof(WCHAR));
+            if (dir_wild_match(pat, fd.cFileName)) {
+                if (ctx->list_n == cap) {
+                    WIN32_FIND_DATAW *nl = realloc(ctx->list, (size_t)(cap ? cap * 2 : 16) * sizeof *nl);
+                    if (!nl) break;
+                    ctx->list = nl;
+                    cap = cap ? cap * 2 : 16;
+                }
+                fd.dwFileAttributes = e->FileAttributes;
+                fd.ftCreationTime.dwLowDateTime    = (DWORD)e->CreationTime.QuadPart;
+                fd.ftCreationTime.dwHighDateTime   = (DWORD)(e->CreationTime.QuadPart >> 32);
+                fd.ftLastAccessTime.dwLowDateTime  = (DWORD)e->LastAccessTime.QuadPart;
+                fd.ftLastAccessTime.dwHighDateTime = (DWORD)(e->LastAccessTime.QuadPart >> 32);
+                fd.ftLastWriteTime.dwLowDateTime   = (DWORD)e->LastWriteTime.QuadPart;
+                fd.ftLastWriteTime.dwHighDateTime  = (DWORD)(e->LastWriteTime.QuadPart >> 32);
+                fd.nFileSizeLow  = (DWORD)e->EndOfFile.QuadPart;
+                fd.nFileSizeHigh = (DWORD)(e->EndOfFile.QuadPart >> 32);
+                ctx->list[ctx->list_n++] = fd;
+            }
+            if (!e->NextEntryOffset) break;
+            e = (FILE_FULL_DIR_INFO *)((BYTE *)e + e->NextEntryOffset);
+        }
+    }
+    free(buf);
+    return ctx->list_n;
+}
+
+/* FindNextFileW for either kind of search. */
+static BOOL dir_next(DIR_CONTEXT *ctx)
+{
+    if (ctx->find_handle != DIR_BY_HANDLE)
+        return FindNextFileW(ctx->find_handle, &ctx->find_data);
+    if (ctx->list_i >= ctx->list_n)
+        return FALSE;
+    ctx->find_data = ctx->list[ctx->list_i++];
+    return TRUE;
+}
+
+/* FindClose for either kind of search. */
+static void dir_close(DIR_CONTEXT *ctx)
+{
+    if (ctx->find_handle == DIR_BY_HANDLE) {
+        free(ctx->list);
+        ctx->list = NULL;
+        ctx->list_n = ctx->list_i = 0;
+    } else if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE) {
+        FindClose(ctx->find_handle);
+    }
+    ctx->find_handle = NULL;
+}
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
@@ -824,10 +924,7 @@ void xbox_dir_context_drop(HANDLE FileHandle)
     EnterCriticalSection(&s_dir_cs);
     for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
         if (s_dir_contexts[i].file_handle == FileHandle) {
-            if (s_dir_contexts[i].find_handle &&
-                s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
-                FindClose(s_dir_contexts[i].find_handle);
-            s_dir_contexts[i].find_handle = NULL;
+            dir_close(&s_dir_contexts[i]);
             s_dir_contexts[i].file_handle = NULL;
             s_dir_contexts[i].first_done = FALSE;
         }
@@ -858,10 +955,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         return STATUS_INSUFFICIENT_RESOURCES;
 
     if (RestartScan || !ctx->first_done) {
-        if (ctx->find_handle && ctx->find_handle != INVALID_HANDLE_VALUE) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
-        }
+        dir_close(ctx);
         WCHAR search_path[XBOX_HOST_PATH];
         WCHAR dir_path[XBOX_HOST_PATH];
         DWORD path_len = GetFinalPathNameByHandleW(FileHandle, dir_path, XBOX_HOST_PATH,
@@ -885,6 +979,14 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             swprintf_s(search_path, XBOX_HOST_PATH, L"%s\\*", clean_path);
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
+        if (ctx->find_handle == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION) {
+            const WCHAR *pat = wcsrchr(search_path, L'\\');
+            ctx->find_handle = DIR_BY_HANDLE;
+            if (!dir_list_by_handle(ctx, FileHandle, pat ? pat + 1 : L"*") || !dir_next(ctx)) {
+                dir_close(ctx);
+                ctx->find_handle = INVALID_HANDLE_VALUE;
+            }
+        }
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
             ctx->find_handle = NULL;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
@@ -892,9 +994,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
         ctx->first_done = TRUE;
     } else {
-        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
+        if (!dir_next(ctx)) {
+            dir_close(ctx);
             ctx->file_handle = NULL;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
@@ -904,9 +1005,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     /* FATX enumeration never exposes the host's dot directories. */
     while (!wcscmp(ctx->find_data.cFileName, L".") ||
            !wcscmp(ctx->find_data.cFileName, L"..")) {
-        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
+        if (!dir_next(ctx)) {
+            dir_close(ctx);
             ctx->file_handle = NULL;
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
@@ -1088,7 +1188,10 @@ NTSTATUS __stdcall xbox_NtReadFile(
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
 
+    long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;   /* the renderer's [hitch] lines */
     ssize_t n = read(fd, Buffer, Length);
+    if (t0)
+        xbox_ft_io(xbox_ft_ms(t0));
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;

@@ -492,7 +492,13 @@ extern uint32_t xbox_PageTrackLastWrite(uint32_t va, uint32_t len);
 extern uint32_t xbox_PageTrackFrameNo(void);
 extern int  xbox_PageTrackPeek(uint32_t va, uint32_t *gen);
 extern void xbox_ft_gpu(double ms);
-extern void xbox_ft_frame(void);
+extern int  xbox_ft_frame(void);
+extern void xbox_ft_want(int on);
+extern int  xbox_ft_last_text(char *buf, size_t n);
+extern unsigned xbox_ft_window_text(char *buf, size_t n);
+/* a [hitch] line noted at the start of vk_flip, printed after xbox_ft_frame
+ * closed that frame (with its split, file reads and sleeps) */
+static char s_hitch[256];
 extern int  xbox_RtWatchOn(void);
 extern void xbox_RtWatchArm(uint32_t gpu_va, uint32_t bytes);
 extern void xbox_SetContiguousFreeHook(void (*fn)(uint32_t addr, uint32_t size));
@@ -6271,25 +6277,37 @@ static void vk_flip(void)
             uint64_t dt = now - last_ns;
             if (now - window_ns > 10000000000ull) { window_ns = now; lines = 0; }
             if (dt > 50000000ull && lines++ < 30)
-                fprintf(stderr, "[hitch] frame %u: %.0f ms -- %u programs compiled (%.0f ms),"
-                        " %u textures %.1f MB (%.0f ms), %u draws\n", s_frame, dt / 1e6,
-                        s_hz_progs, s_hz_prog_ns / 1e6, s_hz_texs,
-                        s_hz_tex_bytes / 1048576.0, s_hz_tex_ns / 1e6, s_hz_draws);
+                snprintf(s_hitch, sizeof s_hitch, "[hitch] frame %u: %.0f ms -- %u programs compiled (%.0f ms),"
+                         " %u textures %.1f MB (%.0f ms), %u draws", s_frame, dt / 1e6,
+                         s_hz_progs, s_hz_prog_ns / 1e6, s_hz_texs,
+                         s_hz_tex_bytes / 1048576.0, s_hz_tex_ns / 1e6, s_hz_draws);
         }
         last_ns = now;
         s_hz_progs = s_hz_texs = s_hz_draws = 0;
         s_hz_prog_ns = s_hz_tex_ns = s_hz_tex_bytes = 0;
     }
     {
-        static int on = -1;
+        /* [fps] every 5 s (v0.9.2: diagnostics for testers, e.g. the Steam
+         * Deck): with RECOMP_FPS_LOG=1, or while the FPS counter is shown, so
+         * a tester's log has it with the in-game option alone. The frame-time
+         * split (game / translate / gpu wait / present, frame_time.c) is
+         * counted only while this is on. */
+        static int env = -1;
         static uint32_t last_frame;
         static uint64_t last;
         uint64_t now;
-        if (on < 0) {
+        int on;
+        if (env < 0) {
             const char *e = getenv("RECOMP_FPS_LOG");
-            on = e && *e == '1';
+            env = e && *e == '1';
             last = hz_now();
         }
+        static int was_on, fresh;
+        on = env || hud_on();
+        xbox_ft_want(on);
+        if (on && !was_on)
+            fresh = 1;                             /* (again) on: a new window */
+        was_on = on;
         if (on) {
             /* Flip-to-flip intervals, whichever thread runs the executor (the
              * frame-time counter only sees flips on its owner thread): a
@@ -6299,6 +6317,18 @@ static void vk_flip(void)
             static uint64_t prev;
             double dt;
             now = hz_now();
+            if (fresh) {
+                extern void xbox_vblank_report(double, char *, size_t);
+                char vb[128], ft[256];
+                fresh = 0;
+                memset(hist, 0, sizeof hist);
+                n_int = 0;
+                prev = 0;
+                last = now;
+                last_frame = s_frame;
+                xbox_vblank_report(0.0, vb, sizeof vb);   /* restart their counts too */
+                xbox_ft_window_text(ft, sizeof ft);
+            }
             if (prev) {
                 uint64_t b = (now - prev) / 250000u;
                 hist[b > 255 ? 255 : b]++;
@@ -6306,9 +6336,9 @@ static void vk_flip(void)
             }
             prev = now;
             dt = (double)(now - last) / 1e9;
-            if (dt >= 10.0) {
+            if (dt >= 5.0) {
                 extern void xbox_vblank_report(double, char *, size_t);
-                char vb[128];
+                char vb[128], ft[256];
                 uint32_t acc = 0, p50 = 0, p99 = 0, i, lo = 0, hi = 0;
                 for (i = 0; i < 256; i++) {
                     acc += hist[i];
@@ -6320,9 +6350,11 @@ static void vk_flip(void)
                     if (i > p50 * 3 / 2) hi += hist[i];
                 }
                 xbox_vblank_report(dt, vb, sizeof vb);
+                if (!xbox_ft_window_text(ft, sizeof ft))
+                    snprintf(ft, sizeof ft, "frame split not known (other thread)");
                 fprintf(stderr, "[fps] %.1f fps (frame %u), %s; flip interval p50 %.2f p99 %.2f ms,"
-                        " %u short, %u long of %u\n",
-                        (s_frame - last_frame) / dt, s_frame, vb, p50 * 0.25, p99 * 0.25, lo, hi, n_int);
+                        " %u short, %u long of %u; %s\n",
+                        (s_frame - last_frame) / dt, s_frame, vb, p50 * 0.25, p99 * 0.25, lo, hi, n_int, ft);
                 memset(hist, 0, sizeof hist);
                 n_int = 0;
                 last_frame = s_frame;
@@ -6645,7 +6677,19 @@ static void vk_flip(void)
         s_hud_max = 0;
         s_hud_txt[0][0] = 0;
     }
-    xbox_ft_frame();
+    {
+        int counted = xbox_ft_frame();
+        if (s_hitch[0]) {                          /* noted at the start: now with the frame's split */
+            char ft[256];
+            if (counted && xbox_ft_last_text(ft, sizeof ft))
+                fprintf(stderr, "%s; %s\n", s_hitch, ft);
+            else if (xbox_ft_on())                 /* flipped on another thread than the counted one */
+                fprintf(stderr, "%s; split not counted (another thread)\n", s_hitch);
+            else
+                fprintf(stderr, "%s\n", s_hitch);
+            s_hitch[0] = 0;
+        }
+    }
     /* RECOMP_DEBUG: what the renderer holds, every 10 s -- a slow climb in
      * process memory over many level set-ups shows up as the cache that grows. */
     if (debug_on()) {

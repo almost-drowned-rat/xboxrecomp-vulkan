@@ -372,6 +372,53 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
 static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
+
+/* RECOMP_KCALL_WHERE=<ordinal> (diagnostics): where one kernel call comes
+ * from - its return address and the next code-like address deeper on the
+ * guest stack (the caller of a wrapper such as XAPI's QueryPerformanceCounter),
+ * counted per pair and ranked in the 2 s summary. Found the 3 s QPC busy wait
+ * after a save is read (THPS 2X, v0.9.2). */
+#define KCALL_WHERE_SLOTS 16
+static int s_kcall_where = -2;
+static struct { uint32_t ret, caller; unsigned long long n; } s_kcall_tab[KCALL_WHERE_SLOTS];
+
+static int kcall_where_on(uint32_t ordinal)
+{
+    if (s_kcall_where == -2) {
+        const char *e = getenv("RECOMP_KCALL_WHERE");
+        s_kcall_where = e && *e ? atoi(e) : -1;
+    }
+    return s_kcall_where >= 0 && ordinal == (uint32_t)s_kcall_where;
+}
+
+static void kcall_where_count(void)
+{
+    uint32_t ret = g_esp ? BRIDGE_MEM32(g_esp) : 0, caller = 0, off;
+    int i, free_slot = -1;
+    for (off = 4; g_esp && off <= 0x40; off += 4) {   /* the next return address into the image */
+        uint32_t v = BRIDGE_MEM32(g_esp + off);
+        /* inside the XBE image window (recomp_icall_feedback.h), not a saved
+         * stack address (a guest stack can sit inside that window too) */
+        if (v > RECOMP_ICALL_FB_BASE + 0x1000u && v < RECOMP_ICALL_FB_BASE + RECOMP_ICALL_FB_SIZE
+                && (v > g_esp ? v - g_esp : g_esp - v) > 0x10000u) {
+            caller = v;
+            break;
+        }
+    }
+    for (i = 0; i < KCALL_WHERE_SLOTS; i++) {
+        if (s_kcall_tab[i].n && s_kcall_tab[i].ret == ret && s_kcall_tab[i].caller == caller) {
+            s_kcall_tab[i].n++;
+            return;
+        }
+        if (!s_kcall_tab[i].n && free_slot < 0)
+            free_slot = i;
+    }
+    if (free_slot >= 0) {
+        s_kcall_tab[free_slot].ret = ret;
+        s_kcall_tab[free_slot].caller = caller;
+        s_kcall_tab[free_slot].n = 1;
+    }
+}
 /* 64-bit: a title that polls the clock through the kernel passes 2^31 calls
  * within minutes (X-Men Legends does). As a 32-bit int it wrapped negative,
  * "count <= log budget" turned true, and every kernel call then wrote two log
@@ -2341,7 +2388,10 @@ void xbox_vblank_report(double dt, char *buf, size_t n)
 {
     static uint32_t last;
     uint32_t c = (uint32_t)s_vb_count;
-    snprintf(buf, n, "vblank %.1f Hz", dt > 0 ? (c - last) / dt : 0.0);
+    if (c == last)                                /* RECOMP_VBLANK off (THPS 2X): nothing raised */
+        snprintf(buf, n, "no guest vblank interrupt");
+    else
+        snprintf(buf, n, "guest vblank interrupt %.1f Hz", dt > 0 ? (c - last) / dt : 0.0);
     last = c;
 }
 
@@ -3317,14 +3367,19 @@ static void bridge_NtCreateFile(void)
     {
         extern uint32_t xbox_LastFileError(void);
         uint32_t _e = g_eax ? xbox_LastFileError() : 0u;
+        /* The request too: a host that refuses what Windows allows (Wine:
+         * access denied on a save folder, v0.9.2) shows up as which access. */
         if (g_eax)
-            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s)\n",
+            fprintf(stderr, "  [FILE] -> 0x%08X FAILED (win32 err=%u%s; access 0x%08X share 0x%X"
+                    " disposition %u options 0x%08X)\n",
                     g_eax, _e,
                     _e == 32u ? " ERROR_SHARING_VIOLATION"
                   : _e ==  2u ? " ERROR_FILE_NOT_FOUND"
-                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "");
+                  : _e ==  3u ? " ERROR_PATH_NOT_FOUND" : "",
+                    access, share, disposition, options);
         else
-            fprintf(stderr, "  [FILE] -> 0x%08X\n", g_eax);
+            fprintf(stderr, "  [FILE] -> 0x%08X (access 0x%08X share 0x%X disposition %u options 0x%08X)\n",
+                    g_eax, access, share, disposition, options);
     }
     fflush(stderr);
 }
@@ -9641,6 +9696,8 @@ static void kernel_thunk_dispatch_body(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+    if (kcall_where_on(ordinal))
+        kcall_where_count();
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the
@@ -9681,6 +9738,23 @@ static void kernel_thunk_dispatch_body(void)
                     shown_ord[best] = 1;
                     fprintf(stderr, "  [KERNEL]   ordinal %3d x%llu\n", best,
                             (unsigned long long)g_ordinal_calls[best]);
+                }
+                if (s_kcall_where >= 0) {          /* one line, the most frequent first (the log folds alike lines) */
+                    char line[512];
+                    size_t at = (size_t)snprintf(line, sizeof line, "  [KERNEL]   where ordinal %d:", s_kcall_where);
+                    unsigned char used[KCALL_WHERE_SLOTS] = { 0 };
+                    for (shown = 0; shown < 4; shown++) {
+                        int best = -1;
+                        for (r = 0; r < KCALL_WHERE_SLOTS; r++)
+                            if (s_kcall_tab[r].n && !used[r] && (best < 0 || s_kcall_tab[r].n > s_kcall_tab[best].n))
+                                best = r;
+                        if (best < 0 || at >= sizeof line)
+                            break;
+                        used[best] = 1;
+                        at += (size_t)snprintf(line + at, sizeof line - at, " ret 0x%08X caller 0x%08X x%llu;",
+                                               s_kcall_tab[best].ret, s_kcall_tab[best].caller, s_kcall_tab[best].n);
+                    }
+                    fprintf(stderr, "%s\n", line);
                 }
             }
             fflush(stderr);

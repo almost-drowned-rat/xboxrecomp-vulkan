@@ -13,6 +13,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
+#include "frame_time.h"           /* xbox_ft_sleep: sleeps in the [hitch] lines */
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -190,12 +191,17 @@ NTSTATUS __stdcall xbox_KeDelayExecutionThread(
         ms = (DWORD)(diff / 10000);
     }
 
-    if (Alertable) {
-        DWORD result = SleepEx(ms, TRUE);
+    {
+        long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;   /* the renderer's [hitch] lines */
+        DWORD result = WAIT_OBJECT_0;
+        if (Alertable)
+            result = SleepEx(ms, TRUE);
+        else
+            Sleep(ms);
+        if (t0)
+            xbox_ft_sleep(xbox_ft_ms(t0));
         if (result == WAIT_IO_COMPLETION)
             return STATUS_ALERTED;
-    } else {
-        Sleep(ms);
     }
 
     return STATUS_SUCCESS;

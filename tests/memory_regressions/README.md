@@ -15,8 +15,8 @@ One test per mode, one process each, because the switches are read once and cach
 
 | Test | What it checks |
 |---|---|
-| `memory_regressions_default` | No switch set. Pins what every title gets today: reuse hands a freed block over whole, contiguous memory is never reused, an explicit high base is not honoured. A change to the default fails here. |
-| `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
+| `memory_regressions_reclaim_off` | `RECOMP_HEAP_RECLAIM=0` (until 2026-10-28 `memory_regressions_default`, which still expected this behaviour after reclaim became the default in `6e489a6` and failed on the Linux CI from 2026-10-17). Pins the off switch: reuse hands a freed block over whole, contiguous memory is never reused, an explicit high base is not honoured. |
+| `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1` - the default every title gets. The first table below. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
 
@@ -31,7 +31,7 @@ Each check fails without the change and passes with it.
 | Freeing three neighbours in the order first, second, third merges all three | The third never joins: the merge of the first two left an empty slot that the neighbour search stopped at. |
 | `NtFreeVirtualMemory(MEM_RELEASE)` on memory the heap supplied returns it | `STATUS_UNSUCCESSFUL`. The 32-bit guest slot went to the host `VirtualFree` as a pointer, so nothing came back. |
 | A page `MEM_DECOMMIT` then `MEM_COMMIT` again reads as zero; its neighbours keep their data | The old contents: both calls were no-ops on heap memory, while the console hands recommitted pages back zeroed. |
-| `MmFreeContiguousMemory` gives a contiguous block back and the next request of that size reuses it | Nothing came back: the address went to the general heap, which does not own it, so a title that frees and reloads a scene runs the 64 MB window out. The default mode pins the old bump allocator. |
+| `MmFreeContiguousMemory` gives a contiguous block back and the next request of that size reuses it | Nothing came back: the address went to the general heap, which does not own it, so a title that frees and reloads a scene runs the 64 MB window out. The reclaim-off mode pins the old bump allocator. |
 
 ## `RECOMP_EXT_VMA`
 

@@ -37,7 +37,7 @@ Borrowed code: origin (repo, commit, file) in the header comment and in `docs/so
 | M1 | Entry point runs, log up to the first crash; gap check run |
 | M2 | Vulkan window, logos/movies visible; frame-time counter in place |
 | M3 | Menus usable (keyboard + `--input-script`), audio works, saves/paths per `docs/storage.md` |
-| M4 | One level 10 minutes at 60 fps; game logic decoupled from the frame rate (target 120 fps; options Original / 60 for 25-30 fps titles / 120, no uncapped) |
+| M4 | One level 10 minutes at 60 fps; game logic decoupled from the frame rate (target 120 fps; options Original / 60 for 25-30 fps titles / 120, no uncapped). No interpolation at the original rate (maintainer, 2026-10-28): pure game logic there, also in cut scenes; above it the game's own logic where time based, interpolation only for the higher option and never for cut scenes / movies (`docs/porting_guide.md` M6 FRAME RATE) |
 | M5 | Every item in `docs/testplan.md`; controllers, widescreen, soundtracks, installer (the exe's start check = the launcher item; settings in the in-game RECOMP OPTIONS + settings file, no separate launcher) |
 | M6 | All settings in the game's own options menu |
 
@@ -113,6 +113,10 @@ Borrowed code: origin (repo, commit, file) in the header comment and in `docs/so
 
 - Builds only via `tools/build.ps1` (lock, ≤2 compiler processes, incremental; full rebuild only after lifter
   changes). Test runs always with `--max-seconds`; leave no processes running.
+- **Every merge runs `tools/regress.ps1` first** (maintainer, 2026-10-28; THPS 2X `tools/regress.ps1` is the
+  model): menu tour + screenshot compare (manual shots named), split screen, storage test – one summary line per
+  part (PASS / FAIL / SKIP + evidence path), a fresh run folder, the shared lock, `RECOMP_NO_DIALOGS=1`, windowed.
+  A part that is SKIP (its script does not exist yet) is said in the merge report, never counted as passed.
 - Never load generated code or logs raw – grep / summarize.
 
 ## Portability
