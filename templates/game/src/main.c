@@ -15,6 +15,7 @@
 #include "xinput_xbox.h"
 
 #include "platform/host.h"
+#include "platform/host_info.h"     /* toolkit: the log's version + host lines */
 #include "input.h"
 #if defined(@PREFIX@_VULKAN)
 #include "nv2a_vk.h"
@@ -38,6 +39,7 @@ int main(int argc, char **argv)
     if (host_init(argc, argv, &opt) != 0)
         return 1;
     printf("=== @TITLE@ - static recompilation ===\n");
+    host_log_version_and_host(opt.game_dir);       /* "version: ..." / "host: ..." for bug reports */
 
     snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", opt.game_dir);
     xbe = host_read_file(xbe_path, &xbe_size);

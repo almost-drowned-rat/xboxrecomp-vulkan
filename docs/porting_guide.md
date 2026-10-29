@@ -6,9 +6,10 @@ and the Burnout 3 bench; updated at every milestone. Non-obvious bugs and how to
 [lessons_learned.md](lessons_learned.md). Storage rules: [storage.md](storage.md). Starter repo:
 `templates/game/`.
 
-Conventions used below: the toolkit is checked out next to the game repo (`projects\xboxrecomp`,
-`projects\<game>_recomp`), a junction `C:\rc` → `projects` keeps paths free of spaces, generated C and the install
-layout live in `projects\private\` (never committed).
+Conventions used below (`templates/game/tools/paths.ps1`): the toolkit in `<root>\tools\xboxrecomp` (shared deps +
+lock in `<root>\tools\private\`), the game repo in `<root>\projects\<game>\<game>_recomp`, generated C and the install
+layout in `<root>\projects\<game>\private\` (never committed). Every folder path is free of spaces; no junctions or
+links.
 
 ## Design principles (maintainer decision A10, 2026-10-15)
 
@@ -109,8 +110,8 @@ created with AI assistance (`templates/game/README.md`).
       - exclusive: frame-time measurements, benchmarks, baselines, soak tests, emulator oracle comparisons – alone,
         for the whole run;
       - writer priority (a waiting exclusive request blocks new shared holders); open file handles
-        (`C:\rc\private\build.lock` gate + `lock\slot0|slot1`), so a dead holder releases its share; one line per
-        holder in `<parent folder>\coordination.md` (who, class, what, since, PID + start time), stale lines removed by the
+        (`<root>\tools\private\build.lock` gate + `lock\slot0|slot1`), so a dead holder releases its share; one line per
+        holder in `<root>\tools\coordination.md` (who, class, what, since, PID + start time), stale lines removed by the
         next taker and logged in `lock\lock.log`; nested steps see `RC_GLOBAL_LOCK`.
 - [ ] First runs with `--max-seconds`: every crash → `RECOMP_ICALL_FEEDBACK` dump → seeds → re-lift. A hang →
       `RECOMP_WATCHDOG_SECS=<s>` (guest stack), `RECOMP_PEEK=` (globals, `[ptr]+off`).

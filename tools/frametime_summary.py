@@ -7,7 +7,7 @@ import csv
 import json
 import sys
 
-COLS = ["frame_ms", "game_ms", "translate_ms", "gpu_wait_ms", "present_ms", "gpu_ms", "input_ms"]
+COLS = ["frame_ms", "game_ms", "translate_ms", "gpu_wait_ms", "present_ms", "gpu_ms", "input_ms", "acquire_ms"]
 
 
 def pct(v, p):
@@ -25,7 +25,7 @@ def summarize(path, skip_ms=0.0):
                 rows.append(r)
     out = {"frames": len(rows)}
     for c in COLS:
-        # input_ms: older files lack it; -1 = no pad read that frame
+        # input_ms / acquire_ms: older files lack them; input_ms -1 = no pad read that frame
         v = [float(r[c]) for r in rows if r.get(c) not in (None, "") and float(r[c]) >= 0]
         out[c] = {"avg": sum(v) / len(v) if v else 0.0, "p50": pct(v, 50), "p99": pct(v, 99)}
     if rows:

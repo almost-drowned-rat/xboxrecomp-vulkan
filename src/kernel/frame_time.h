@@ -4,14 +4,16 @@
  * RECOMP_FRAME_TIME=1 writes <data dir>/frametime.csv (xbox_ft_set_dir), any
  * other value is taken as the file path. One row per presented frame:
  *
- *   frame, t_ms, frame_ms, game_ms, translate_ms, gpu_wait_ms, present_ms, gpu_ms, input_ms
+ *   frame, t_ms, frame_ms, game_ms, translate_ms, gpu_wait_ms, present_ms, gpu_ms, input_ms, acquire_ms
  *
  * The categories are exclusive wall time on the thread that presents: game
  * (everything not in another category), translate (pushbuffer executor or D3D
  * HLE recording Vulkan work), gpu_wait (CPU blocked on a GPU fence), present
- * (acquire + present). gpu_ms is the GPU's own span for a frame (timestamp
- * queries), known only when its fence has signalled, so it is reported in the
- * row of the frame that read it back (VK_FRAMES later); -1 = none yet.
+ * (acquire + present; acquire_ms, the last column, is the acquire part of it).
+ * gpu_ms is the GPU's own span for a frame (timestamp queries, written while
+ * the split is counted - the CSV or the renderer's lines), known only when its
+ * fence has signalled, so it is reported in the row of the frame that read it
+ * back (VK_FRAMES later); -1 = none yet.
  * input_ms is the input-to-present latency on the CPU side: from the frame's
  * last pad read by the title (xbox_ft_input, XInputGetState HLE) to the end
  * of its present call; -1 = no read this frame. What the screen adds on top
@@ -48,6 +50,7 @@ unsigned xbox_ft_window_text(char *buf, size_t n);
 void xbox_ft_io(double ms);                   /* any thread: a file read         */
 void xbox_ft_sleep(double ms);                /* any thread: a sleep             */
 void xbox_ft_vblank_wait(double ms);          /* the title waiting for a flip    */
+void xbox_ft_acquire(double ms);              /* the acquire part of "present"   */
 long long xbox_ft_now(void);                  /* a counter value for xbox_ft_ms  */
 double xbox_ft_ms(long long since);
 void xbox_ft_set_dir(const char *data_dir);   /* where "1" puts frametime.csv */

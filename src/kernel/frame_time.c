@@ -33,10 +33,11 @@ static volatile LONGLONG s_input;               /* last pad read, 0 = none this 
 /* file reads and sleeps of any thread, in microseconds (xbox_ft_io / _sleep);
  * 32 bits: taken back to 0 every frame (the POSIX layer has no 64-bit add) */
 static volatile LONG s_io_n, s_io_us, s_sleep_us, s_vbw_us;   /* + flip waits (xbox_ft_vblank_wait) */
+static double   s_acq;                          /* the acquire part of "present" (xbox_ft_acquire) */
 /* the last closed frame and the sums since the last xbox_ft_window */
-static double   s_last[XBOX_FT_COUNT], s_last_total, s_last_io_ms, s_last_sleep_ms, s_last_vbw;
+static double   s_last[XBOX_FT_COUNT], s_last_total, s_last_io_ms, s_last_sleep_ms, s_last_vbw, s_last_acq;
 static unsigned s_last_io_n;
-static double   s_win[XBOX_FT_COUNT], s_win_gpu, s_win_max, s_win_vbw;
+static double   s_win[XBOX_FT_COUNT], s_win_gpu, s_win_max, s_win_vbw, s_win_acq;
 static unsigned s_win_n, s_win_gpu_n;
 
 static LONGLONG now(void)
@@ -96,7 +97,8 @@ static int start(void)
             s_csv = 0;
         } else {
             setvbuf(s_f, NULL, _IOFBF, 1 << 16);
-            fprintf(s_f, "frame,t_ms,frame_ms,game_ms,translate_ms,gpu_wait_ms,present_ms,gpu_ms,input_ms\n");
+            fprintf(s_f, "frame,t_ms,frame_ms,game_ms,translate_ms,gpu_wait_ms,present_ms,gpu_ms,input_ms,"
+                         "acquire_ms\n");
             fprintf(stderr, "  FRAMETIME: writing %s\n", path);
         }
     }
@@ -172,6 +174,16 @@ void xbox_ft_vblank_wait(double ms)
     InterlockedExchangeAdd(&s_vbw_us, (LONG)(ms * 1000.0));
 }
 
+/* The presenting thread: how long acquiring the swapchain image took - part of
+ * "present" (which is acquire + present), shown on its own so a report tells
+ * which of the two calls blocks. */
+void xbox_ft_acquire(double ms)
+{
+    if (!xbox_ft_on() || !s_started || GetCurrentThreadId() != s_owner)
+        return;
+    s_acq += ms;
+}
+
 long long xbox_ft_now(void)
 {
     return (long long)now();
@@ -198,10 +210,10 @@ int xbox_ft_frame(void)
     in = s_input;
     s_input = 0;
     if (s_f) {
-        fprintf(s_f, "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", s_frame,
+        fprintf(s_f, "%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", s_frame,
                 (double)(t - s_t0) * s_tick_ms, total, s_acc[XBOX_FT_GAME], s_acc[XBOX_FT_TRANSLATE],
                 s_acc[XBOX_FT_GPU_WAIT], s_acc[XBOX_FT_PRESENT], s_gpu,
-                in ? (double)(t - in) * s_tick_ms : -1.0);
+                in ? (double)(t - in) * s_tick_ms : -1.0, s_acq);
         if (s_frame % 60 == 0)
             fflush(s_f);
     }
@@ -215,6 +227,9 @@ int xbox_ft_frame(void)
     s_last_sleep_ms = (double)InterlockedExchange(&s_sleep_us, 0) / 1000.0;
     s_last_vbw = (double)InterlockedExchange(&s_vbw_us, 0) / 1000.0;
     s_win_vbw += s_last_vbw;
+    s_last_acq = s_acq;
+    s_win_acq += s_acq;
+    s_acq = 0.0;
     if (total > s_win_max)
         s_win_max = total;
     if (s_gpu >= 0.0) {
@@ -234,9 +249,9 @@ int xbox_ft_last_text(char *buf, size_t n)
     if (!s_started || !s_frame)
         return 0;
     snprintf(buf, n, "counted %.1f ms = game %.1f (vblank wait %.1f), translate %.1f, gpu wait %.1f, present "
-             "%.1f; %u file reads %.1f ms, sleeps %.1f ms", s_last_total, s_last[XBOX_FT_GAME], s_last_vbw,
-             s_last[XBOX_FT_TRANSLATE], s_last[XBOX_FT_GPU_WAIT], s_last[XBOX_FT_PRESENT], s_last_io_n,
-             s_last_io_ms, s_last_sleep_ms);
+             "%.1f (acquire %.1f); %u file reads %.1f ms, sleeps %.1f ms", s_last_total, s_last[XBOX_FT_GAME],
+             s_last_vbw, s_last[XBOX_FT_TRANSLATE], s_last[XBOX_FT_GPU_WAIT], s_last[XBOX_FT_PRESENT], s_last_acq,
+             s_last_io_n, s_last_io_ms, s_last_sleep_ms);
     return 1;
 }
 
@@ -244,14 +259,15 @@ unsigned xbox_ft_window_text(char *buf, size_t n)
 {
     unsigned f = s_win_n;
     double d = f ? (double)f : 1.0;
-    char gpu[32] = "";                            /* GPU timestamps: RECOMP_FRAME_TIME only */
+    char gpu[32] = "";                            /* GPU timestamps: whenever the split is counted */
     if (s_win_gpu_n)
         snprintf(gpu, sizeof gpu, ", gpu %.1f", s_win_gpu / s_win_gpu_n);
-    snprintf(buf, n, "frame split game %.1f (vblank wait %.1f), translate %.1f, gpu wait %.1f, present %.1f%s ms "
-             "(average), longest %.1f ms", s_win[XBOX_FT_GAME] / d, s_win_vbw / d, s_win[XBOX_FT_TRANSLATE] / d,
-             s_win[XBOX_FT_GPU_WAIT] / d, s_win[XBOX_FT_PRESENT] / d, gpu, s_win_max);
+    snprintf(buf, n, "frame split game %.1f (vblank wait %.1f), translate %.1f, gpu wait %.1f, present %.1f "
+             "(acquire %.1f)%s ms (average), longest %.1f ms", s_win[XBOX_FT_GAME] / d, s_win_vbw / d,
+             s_win[XBOX_FT_TRANSLATE] / d, s_win[XBOX_FT_GPU_WAIT] / d, s_win[XBOX_FT_PRESENT] / d, s_win_acq / d,
+             gpu, s_win_max);
     memset(s_win, 0, sizeof s_win);
     s_win_n = s_win_gpu_n = 0;
-    s_win_gpu = s_win_max = s_win_vbw = 0.0;
+    s_win_gpu = s_win_max = s_win_vbw = s_win_acq = 0.0;
     return f;
 }

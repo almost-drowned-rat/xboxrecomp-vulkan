@@ -482,6 +482,7 @@ typedef struct {
     VkDeviceSize    ring_off;
     int             submitted;
     int             stamped;      /* timestamps written this frame (frame_time.h) */
+    int             stamping;     /* the begin stamp went in (split counted at frame_begin) */
     Garbage        *garbage;
     uint32_t        ngarbage, garbage_cap;
 } Frame;
@@ -513,13 +514,16 @@ extern int  xbox_ft_frame(void);
 extern void xbox_ft_want(int on);
 extern int  xbox_ft_last_text(char *buf, size_t n);
 extern unsigned xbox_ft_window_text(char *buf, size_t n);
+extern void xbox_ft_acquire(double ms);
+extern long long xbox_ft_now(void);
+extern double xbox_ft_ms(long long since);
 /* a [hitch] line noted at the start of vk_flip, printed after xbox_ft_frame
  * closed that frame (with its split, file reads and sleeps) */
 static char s_hitch[256];
 extern int  xbox_RtWatchOn(void);
 extern void xbox_RtWatchArm(uint32_t gpu_va, uint32_t bytes);
 extern void xbox_SetContiguousFreeHook(void (*fn)(uint32_t addr, uint32_t size));
-static VkQueryPool s_ts_pool;  /* 2 timestamps per frame slot, RECOMP_FRAME_TIME only */
+static VkQueryPool s_ts_pool;  /* 2 timestamps per frame slot, written while the split is counted */
 static double      s_ts_ms;    /* ms per timestamp tick */
 static uint64_t    s_ts_mask;
 static int s_dyn_valid;
@@ -590,7 +594,8 @@ static void frame_begin(void)
     vkResetCommandPool(s_dev, s_f->pool, 0);
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(s_f->cb, &bi);
-    if (s_ts_pool) {
+    s_f->stamping = s_ts_pool && xbox_ft_on();
+    if (s_f->stamping) {
         vkCmdResetQueryPool(s_f->cb, s_ts_pool, s_fi * 2, 2);
         vkCmdWriteTimestamp(s_f->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_ts_pool, s_fi * 2);
     }
@@ -4002,7 +4007,9 @@ static int ready(void)
         }
     }
 
-    if (xbox_ft_on() && s_ts_mask) {
+    /* always made (VK_FRAMES * 2 queries): the FPS counter can turn the split on
+     * in the middle of a run; the stamps are written only while it is counted */
+    if (s_ts_mask) {
         VkQueryPoolCreateInfo qi = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
         VkPhysicalDeviceProperties tp;
         vkGetPhysicalDeviceProperties(s_pd, &tp);
@@ -6869,10 +6876,13 @@ static void vk_flip(void)
     VT("flip %u: surface %08X drew %d, acquiring\n", s_frame, s ? s->va : 0, s_drew_any);
     if (!s_headless) {
         VkResult rr;
+        long long t_acq = xbox_ft_on() ? xbox_ft_now() : 0;
         xbox_ft_push(FT_PRESENT);
         rr = vkAcquireNextImageKHR(s_dev, s_swapchain, UINT64_MAX, s_f->acquired,
                                    VK_NULL_HANDLE, &idx);
         xbox_ft_pop();
+        if (t_acq)
+            xbox_ft_acquire(xbox_ft_ms(t_acq));  /* shown on its own: which of the two calls blocks */
         if (rr == VK_ERROR_OUT_OF_DATE_KHR) {
             vkDeviceWaitIdle(s_dev);
             create_swapchain();
@@ -6972,7 +6982,7 @@ static void vk_flip(void)
         }
     }
     VT("flip %u: submit (image %d)\n", s_frame, have_image);
-    if (s_ts_pool) {
+    if (s_f->stamping) {
         vkCmdWriteTimestamp(s_cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_ts_pool, s_fi * 2 + 1);
         s_f->stamped = 1;
     }

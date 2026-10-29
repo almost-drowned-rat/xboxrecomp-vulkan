@@ -18,9 +18,8 @@ param(
     [switch]$Force
 )
 $ErrorActionPreference = "Stop"
-$Short = "C:\rc"                                    # junction -> the repos' parent folder
-if (-not (Test-Path $Short)) { throw "Junction $Short missing - run tools\setup.ps1" }
-$Root    = Join-Path $Short "private\deps"
+. (Join-Path $PSScriptRoot "paths.ps1")            # $Shared = <root>\tools\private (deps are shared)
+$Root    = Join-Path $Shared "deps"
 $SrcRoot = Join-Path $Root "src"
 $BldRoot = Join-Path $Root "build"
 $Prefix  = Join-Path $Root "install"

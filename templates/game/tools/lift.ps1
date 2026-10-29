@@ -17,15 +17,14 @@ param(
     [string]$Layout
 )
 $ErrorActionPreference = "Stop"
-$Repo     = Split-Path -Parent $PSScriptRoot
-$Projects = Split-Path -Parent $Repo
-$Toolkit  = Join-Path $Projects "xboxrecomp"
-$Private  = Join-Path $Projects "private\@NAME@"
-if (-not $Layout) { $Layout = Join-Path $Projects "private\install\@TITLE@ Recomp" }
+. (Join-Path $PSScriptRoot "paths.ps1")   # $Repo, $Private, $ToolsRoot
+$Toolkit  = Join-Path $ToolsRoot "xboxrecomp"
+$LiftDir  = Join-Path $Private "@NAME@"
+if (-not $Layout) { $Layout = Join-Path $Private "install\@TITLE@ Recomp" }
 $Game     = Join-Path $Layout "game"
 $Xbe      = Join-Path $Game "default.xbe"
-$Pipe     = Join-Path $Private "pipeline"
-$Gen      = Join-Path $Private "gen"
+$Pipe     = Join-Path $LiftDir "pipeline"
+$Gen      = Join-Path $LiftDir "gen"
 $XbeSha1  = "@XBESHA1@"   # @TITLE@ (@REGION@), docs/xbe.md
 
 function Run([string]$what, [string[]]$a) {

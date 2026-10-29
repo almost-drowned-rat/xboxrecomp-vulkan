@@ -8,7 +8,7 @@
 #     private\build\<worktree folder name>
 # - output goes into the portable install layout, never into the repo:
 #     private\install\@TITLE@ Recomp\@EXE@.exe
-# Compiler: llvm-mingw clang + Ninja via the short path C:\rc (no spaces).
+# Paths: tools\paths.ps1 (space-free; llvm-mingw clang + Ninja use them directly).
 # glslang/SDL3 for the Vulkan renderer: built with the same compiler by tools\deps.ps1 (docs/toolkit.md).
 
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '', Justification = 'Interactive script; console status output only.')]
@@ -18,19 +18,17 @@ param(
     [string]$Layout
 )
 $ErrorActionPreference = "Stop"
-$Repo   = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "paths.ps1")           # $Repo, $Private, $ToolsRoot, $Shared
 $Name   = Split-Path -Leaf $Repo
-$Short  = "C:\rc"                                   # junction -> the repos' parent folder
-if (-not (Test-Path $Short)) { throw "Junction $Short missing - run tools\setup.ps1" }
-$Src    = Join-Path $Short $Name
-$Build  = Join-Path $Short "private\build\$Name"
-if (-not $Layout) { $Layout = Join-Path $Short "private\install\@TITLE@ Recomp" }
+$Src    = $Repo
+$Build  = Join-Path $Private "build\$Name"
+if (-not $Layout) { $Layout = Join-Path $Private "install\@TITLE@ Recomp" }
 if ($Jobs -gt 2) { $Jobs = 2 }
 
 $clang = (Get-Command clang -ErrorAction SilentlyContinue).Source
 if (-not $clang) { throw "clang (llvm-mingw) not on PATH - run tools\setup.ps1" }
 $bin = Split-Path -Parent $clang
-$Deps = Join-Path $Short "private\deps\install"     # glslang + SDL3 (tools\deps.ps1)
+$Deps = Join-Path $Shared "deps\install"           # glslang + SDL3 (tools\deps.ps1)
 if (-not (Test-Path (Join-Path $Deps "lib\libglslang.a"))) { throw "glslang/SDL3 missing - run tools\deps.ps1" }
 
 New-Item -ItemType Directory -Force -Path $Build, $Layout | Out-Null
@@ -52,8 +50,8 @@ try {
         "-DCMAKE_PREFIX_PATH=$(Cm $Deps)" `
         "-DCMAKE_RC_COMPILER=$(Cm (Join-Path $bin 'llvm-rc.exe'))" `
         "-D@PREFIX@_OUTPUT_DIR=$(Cm $Layout)" `
-        "-DXBOXRECOMP_DIR=$(Cm (Join-Path $Short 'xboxrecomp'))" `
-        "-DRECOMP_GEN_DIR=$(Cm (Join-Path $Short 'private\@NAME@\gen'))" | Out-Null
+        "-DXBOXRECOMP_DIR=$(Cm (Join-Path $ToolsRoot 'xboxrecomp'))" `
+        "-DRECOMP_GEN_DIR=$(Cm (Join-Path $Private '@NAME@\gen'))" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
     $t = [Diagnostics.Stopwatch]::StartNew()
     & cmake --build $Build --parallel $Jobs

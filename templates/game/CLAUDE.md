@@ -16,16 +16,19 @@ C/SDL3/Vulkan, no busy-waiting, LLE compile-time optional, ...): toolkit `docs/p
 ## Layout and sources
 
 ```
-<parent folder>\
-  roms\xbox\       the maintainer's disc images – read only, never modify, move or rename (@ISO@)
-  projects\
-    @NAME@_recomp\ this repo
-    xboxrecomp\    toolkit fork (branch vulkan-backend)
-    refs\          read only – never modify; reference builds only out of tree
-    private\       local inputs and outputs: extracted disc, generated C, install layout, logs (never committed)
+<root>\
+  roms\xbox\             the maintainer's disc images – read only, never modify, move or rename (@ISO@)
+  projects\@NAME@\
+    @NAME@_recomp\       this repo
+    private\             local inputs and outputs: extracted disc, generated C, install layout, logs (never committed)
+  tools\
+    xboxrecomp\          toolkit fork (branch vulkan-backend)
+    refs\                read only – never modify; reference builds only out of tree
+    private\             shared: deps, the global lock
 ```
 
-Paths contain spaces: always quote them. Builds run via the junction `C:\rc` → `<parent folder>\projects`.
+Folder paths contain no spaces (`tools\paths.ps1` refuses them; the build uses them directly); file names may - always
+quote them. No junctions or links.
 **Search first, then build:** search `refs/` and the toolkit history before implementing or debugging.
 Borrowed code: origin (repo, commit, file) in the header comment and in `docs/sources.md`.
 
@@ -146,7 +149,7 @@ Every port uses this layout – not negotiable (toolkit `docs/porting_guide.md`,
 
 - **Nothing is written outside this folder:** no AppData, no registry, no temp files left behind. All paths are
   relative to the exe; `xbox_path_init_cfg` with explicit `game_dir`, `save_dir`, `data_dir`.
-- **Media on the dev machine** (maintainer, 2026-10-25): the master is `<parent folder>\media\` (never modified or
+- **Media on the dev machine** (maintainer, 2026-10-25): the master is `<root>\media\` (never modified or
   deleted); test layouts and this game's layout get a **copy** of `media/` from it, never a junction or link.
 - **First start = the installer** (toolkit `src/install/game_setup.h`; no separate launcher): the player puts the
   extracted disc or one disc image (XISO or full redump) into `game/`; `main.c` calls `xr_game_setup` before the boot

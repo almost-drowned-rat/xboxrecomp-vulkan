@@ -12,10 +12,9 @@ param(
     [string]$Iso = "@ISO@"
 )
 $ErrorActionPreference = "Stop"
-$Projects = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$Repo     = Split-Path -Parent $PSScriptRoot
-$Toolkit  = Join-Path $Projects "refs\xboxrecomp-upstream"
-$Out      = Join-Path $Projects "private\@NAME@"
+. (Join-Path $PSScriptRoot "paths.ps1")   # $Repo, $Private, $ToolsRoot
+$Toolkit  = Join-Path $ToolsRoot "refs\xboxrecomp-upstream"
+$Out      = Join-Path $Private "@NAME@"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
 
 if (-not (Test-Path -LiteralPath $Iso)) { throw "Disc image not found: $Iso" }

@@ -27,10 +27,10 @@ $DisplayEnv   = "GAME_DISPLAY_MODE"                # the port's display-mode ove
 $KnownUnimpl  = "(?!)"                             # [UNIMPL] lines in every build so far, with the reason, e.g.
                                                    # "\[UNIMPL\].*at 0x(00013A42|0002040E)\b" (THPS 2X: D3D port I/O)
 # ──
-$Repo = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "paths.ps1")   # $Repo, $Private
 . (Join-Path $Repo "tools\run_dir.ps1")
 . (Join-Path $Repo "tools\lock.ps1")
-if (-not $Out) { $Out = "C:\rc\private\evidence\regress\$(Get-RunStamp)" }
+if (-not $Out) { $Out = Join-Path $Private "evidence\regress\$(Get-RunStamp)" }
 $Out = New-RunDir $Out
 $Problems = "\[NULLPTR\]|\[UNIMPL\]|FATAL|Failed to resolve|is not code|access violation|unhandled exception"
 $summary = New-Object System.Collections.Generic.List[string]

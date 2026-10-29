@@ -3,9 +3,9 @@
 Starter repo for a new port on this toolkit fork. Create a port:
 
 ```
-powershell -ExecutionPolicy Bypass -File templates\game\new_port.ps1 -Dest "<parent folder>\projects\mygame_recomp" `
+powershell -ExecutionPolicy Bypass -File templates\game\new_port.ps1 -Dest "<root>\projects\mygame\mygame_recomp" `
     -Title "My Game" -Name mygame -Exe MYGAME -Prefix MYGAME -Region USA `
-    -Iso "<parent folder>\roms\xbox\My Game (USA).iso" [-XbeSha1 <sha1>] [-TitleId <8 hex>]
+    -Iso "<root>\roms\xbox\My Game (USA).iso" [-XbeSha1 <sha1>] [-TitleId <8 hex>]
 ```
 
 Placeholders replaced: `@TITLE@ @NAME@ @EXE@ @PREFIX@ @REGION@ @ISO@ @XBESHA1@ @TITLEID@`. Then follow
