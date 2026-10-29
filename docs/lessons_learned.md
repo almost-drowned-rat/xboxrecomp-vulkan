@@ -202,6 +202,21 @@ new one at the milestone it was found. Workflow: [porting_guide.md](porting_guid
   runs per rate as the noise floor (porting guide, M6 FRAME RATE: the 120 check). Grep the level loop for the
   frame-time conversion: integer division / `>>` on the step, a squared step.
 
+### A player's game ran on without a picture: the device lacked one Vulkan extension (THPS 2X, v0.9.2)
+- **Symptom:** a player log (AMD Radeon RX 580, Windows, Vulkan 1.3.260) shows `vkCreateDevice failed` and then
+  the game running on - sound, saves, no window content.
+- **Cause:** AMD's Windows driver for Polaris (RX 400 / RX 500) has no `VK_EXT_vertex_input_dynamic_state`;
+  `nv2a_vk` requested it unconditionally and, when device creation failed, fell back to its headless test path.
+- **Fix:** device check at start (`8ac412a`): every failure of window, instance, device or swapchain ends in
+  `vk_fatal` - log + message box naming the GPU, the driver's Vulkan version and every missing item, then the
+  port's handler (`nv2a_vk_set_fatal_handler`, its requirements link); headless only when asked for
+  (`RECOMP_VK_HEADLESS=1`, SDL offscreen). `RECOMP_VK_TEST_MISSING=<extension>` fakes a missing extension for tests.
+  For devices without the extension: the vertex formats are baked into the pipelines (THPS 2X v0.9.3;
+  `RECOMP_VK_NO_DYN_VERTEX_INPUT=1` forces it on any GPU).
+- **Spot early:** a test-only fallback (headless) must never be reachable from a player's failure. Check every
+  required extension against gpuinfo.org per vendor and OS before relying on it (Polaris has it on Linux/RADV,
+  not on Windows), and keep a switch that forces each fallback on the dev GPU so it gets tested.
+
 ## Kernel, files, storage
 
 ### Saves land in the game folder; guest paths reach host drives (THPS 2X, M3)

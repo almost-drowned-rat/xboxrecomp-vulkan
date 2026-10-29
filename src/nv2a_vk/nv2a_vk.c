@@ -18,7 +18,9 @@
  *   pipelines  keyed by the shader pair, blend state, colour mask, whether
  *              there is a depth buffer and the topology class; everything
  *              else (depth, stencil, cull, winding, topology, vertex layout,
- *              viewport) is dynamic state.
+ *              viewport) is dynamic state. Without
+ *              VK_EXT_vertex_input_dynamic_state the vertex formats join the
+ *              key and only the strides stay dynamic (s_baked_vi).
  *   uniforms   two std140 blocks per draw in the frame ring, textures as
  *              combined image samplers, all through push descriptors.
  *
@@ -50,6 +52,9 @@
  *   RECOMP_VK_FAIL_ALLOC_MB=<n>      test: images above n MB fail to
  *                                    allocate (the render-scale / MSAA
  *                                    fallbacks)
+ *   RECOMP_VK_NO_DYN_VERTEX_INPUT=1  bake the vertex formats into the
+ *                                    pipelines as on devices without
+ *                                    VK_EXT_vertex_input_dynamic_state (tests)
  *   RECOMP_VK_VALIDATION=1           (Linux) enable the Khronos validation layer
  *   RECOMP_VK_HEADLESS=1             (Linux) no window, no present
  */
@@ -76,6 +81,7 @@
 #include <pthread.h>
 #endif
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +136,11 @@ static int              s_have_bc, s_have_depth_clamp;
 
 static PFN_vkCmdPushDescriptorSetKHR  p_push_desc;
 static PFN_vkCmdSetVertexInputEXT     p_vertex_input;
+static PFN_vkCmdBindVertexBuffers2    p_bind_vb2;
+/* 1: the vertex formats are baked into the pipelines (the device lacks
+ * VK_EXT_vertex_input_dynamic_state, e.g. AMD Polaris on Windows, or
+ * RECOMP_VK_NO_DYN_VERTEX_INPUT=1); only the strides stay dynamic (core 1.3). */
+static int s_baked_vi;
 static PFN_vkCmdBeginRendering        p_begin_rendering;
 static PFN_vkCmdEndRendering          p_end_rendering;
 static PFN_vkCmdSetCullMode           p_cull_mode;
@@ -154,11 +165,17 @@ static int            s_headless;
  * pumps the window's events in vk_flip. */
 static void (*s_key_handler)(int scancode, int down);
 static void (*s_quit_handler)(void);
+/* The renderer cannot start (nv2a_vk_set_fatal_handler): the port's exit, the
+ * message box title and a help line (e.g. the README's requirements link). */
+static void (*s_fatal_handler)(void);
+static const char *s_fatal_title;
+static const char *s_fatal_help;
 /* A screenshot asked for by name (vk_screenshot). */
 static char s_shot_name[32];
 static volatile int s_shot_pending;
 #if !defined(__SWITCH__)
 static SDL_Window    *s_win;
+static SDL_ThreadID   s_win_thread;     /* the NV2A thread, which made s_win */
 #endif
 static volatile float s_display_hz;     /* nv2a_vk_display_hz; 0 = not known */
 
@@ -2932,7 +2949,12 @@ typedef struct {
     int      prog;
     uint32_t blend, bsrc, bdst, beq, cmask, depth, topo;
     uint32_t samples;                       /* MSAA sample count of the target, 0 = 1 */
+    uint8_t  vfmt[NV2A_RAW_ATTRS];          /* s_baked_vi only: VkFormat per attribute */
 } PipeKey;
+
+/* The part of PipeKey that is hashed and compared: without s_baked_vi the
+ * formats are dynamic state and stay out of the key. */
+#define PIPE_KEY_BYTES (s_baked_vi ? sizeof(PipeKey) : offsetof(PipeKey, vfmt))
 
 typedef struct {
     PipeKey key;
@@ -3007,23 +3029,31 @@ typedef struct {
     Nv2aPshKey pk;
     uint32_t   blend, bsrc, bdst, beq, cmask, depth, topo;
 } PipeRec;
+/* s_baked_vi: the same plus the vertex formats, in vkpipes_vi.bin. */
+typedef struct {
+    PipeRec r;
+    uint8_t vfmt[NV2A_RAW_ATTRS];
+} PipeRecVi;
+#define PIPE_REC_FILE  (s_baked_vi ? "vkpipes_vi.bin" : "vkpipes.bin")
+#define PIPE_REC_BYTES (s_baked_vi ? sizeof(PipeRecVi) : sizeof(PipeRec))
 static uint32_t s_pipes_unsaved;
 
 static void pipe_rec_append(const PipeKey *k)
 {
     char path[256];
-    PipeRec rec;
+    PipeRecVi rec;
     FILE *f;
-    if (s_prewarming || !cache_path(path, sizeof path, "vkpipes.bin"))
+    if (s_prewarming || !cache_path(path, sizeof path, PIPE_REC_FILE))
         return;
     memset(&rec, 0, sizeof rec);
-    rec.magic = PIPE_REC_MAGIC;
-    rec.vkey = s_prog[k->prog].vkey;
-    rec.pk = s_prog[k->prog].pkey;
-    rec.blend = k->blend; rec.bsrc = k->bsrc; rec.bdst = k->bdst; rec.beq = k->beq;
-    rec.cmask = k->cmask; rec.depth = k->depth; rec.topo = k->topo;
+    rec.r.magic = PIPE_REC_MAGIC;
+    rec.r.vkey = s_prog[k->prog].vkey;
+    rec.r.pk = s_prog[k->prog].pkey;
+    rec.r.blend = k->blend; rec.r.bsrc = k->bsrc; rec.r.bdst = k->bdst; rec.r.beq = k->beq;
+    rec.r.cmask = k->cmask; rec.r.depth = k->depth; rec.r.topo = k->topo;
+    memcpy(rec.vfmt, k->vfmt, sizeof rec.vfmt);
     if ((f = fopen(path, "ab"))) {
-        fwrite(&rec, sizeof rec, 1, f);
+        fwrite(&rec, PIPE_REC_BYTES, 1, f);
         fclose(f);
     }
 }
@@ -3057,14 +3087,29 @@ static VkPipeline pipe_get(const PipeKey *k)
         VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
         VK_DYNAMIC_STATE_DEPTH_BIAS,
     };
+    /* s_baked_vi: the same, with the strides dynamic instead of the whole
+     * vertex input. */
+    static const VkDynamicState dyn_baked[] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE,
+        VK_DYNAMIC_STATE_DEPTH_BIAS,
+    };
+    VkVertexInputBindingDescription vb[NV2A_RAW_ATTRS];
+    VkVertexInputAttributeDescription va[NV2A_RAW_ATTRS];
     VkPipeline pipe = VK_NULL_HANDLE;
     VkProg *p = &s_prog[k->prog];
+    size_t kb = PIPE_KEY_BYTES;
 
-    for (i = 0; i < sizeof *k / 4; i++)
+    for (i = 0; i < kb / 4; i++)
         h = (h ^ w[i]) * 16777619u;
     h &= PIPE_BUCKETS - 1;
     for (e = s_pipe_head[h]; e; e = s_pipes[e - 1].next)
-        if (s_pipes[e - 1].pipe && !memcmp(&s_pipes[e - 1].key, k, sizeof *k))
+        if (s_pipes[e - 1].pipe && !memcmp(&s_pipes[e - 1].key, k, kb))
             return s_pipes[e - 1].pipe;
 
     memset(st, 0, sizeof st);
@@ -3098,6 +3143,23 @@ static VkPipeline pipe_get(const PipeKey *k)
     cb.pAttachments = &ba;
     dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]);
     dy.pDynamicStates = dyn;
+    if (s_baked_vi) {
+        for (i = 0; i < NV2A_RAW_ATTRS; i++) {
+            vb[i].binding = i;
+            vb[i].stride = 0;                     /* dynamic: upload_vertices */
+            vb[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            va[i].location = i;
+            va[i].binding = i;
+            va[i].format = (VkFormat)k->vfmt[i];
+            va[i].offset = 0;
+        }
+        vi.vertexBindingDescriptionCount = NV2A_RAW_ATTRS;
+        vi.pVertexBindingDescriptions = vb;
+        vi.vertexAttributeDescriptionCount = NV2A_RAW_ATTRS;
+        vi.pVertexAttributeDescriptions = va;
+        dy.dynamicStateCount = (uint32_t)(sizeof dyn_baked / sizeof dyn_baked[0]);
+        dy.pDynamicStates = dyn_baked;
+    }
     rci.colorAttachmentCount = 1;
     rci.pColorAttachmentFormats = &cfmt;
     if (k->depth) {
@@ -3198,7 +3260,7 @@ static void prewarm(void)
     uint64_t t0 = hz_now();
     uint32_t nprog = 0, npipe = 0, bad = 0;
     ProgRec rec;
-    PipeRec pr;
+    PipeRecVi pr;
 
     spv_load();
     s_prewarming = 1;
@@ -3212,17 +3274,19 @@ static void prewarm(void)
         }
         fclose(f);
     }
-    if (cache_path(path, sizeof path, "vkpipes.bin") && (f = fopen(path, "rb"))) {
-        while (fread(&pr, sizeof pr, 1, f) == 1) {
+    if (cache_path(path, sizeof path, PIPE_REC_FILE) && (f = fopen(path, "rb"))) {
+        memset(&pr, 0, sizeof pr);
+        while (fread(&pr, PIPE_REC_BYTES, 1, f) == 1) {
             VkProg *p;
             PipeKey k;
-            if (pr.magic != PIPE_REC_MAGIC) { bad++; break; }
-            if (!(p = prog_find(pr.vkey, &pr.pk)))
+            if (pr.r.magic != PIPE_REC_MAGIC) { bad++; break; }
+            if (!(p = prog_find(pr.r.vkey, &pr.r.pk)))
                 continue;
             memset(&k, 0, sizeof k);
             k.prog = (int)(p - s_prog);
-            k.blend = pr.blend; k.bsrc = pr.bsrc; k.bdst = pr.bdst; k.beq = pr.beq;
-            k.cmask = pr.cmask; k.depth = pr.depth; k.topo = pr.topo;
+            k.blend = pr.r.blend; k.bsrc = pr.r.bsrc; k.bdst = pr.r.bdst; k.beq = pr.r.beq;
+            k.cmask = pr.r.cmask; k.depth = pr.r.depth; k.topo = pr.r.topo;
+            memcpy(k.vfmt, pr.vfmt, sizeof k.vfmt);
             if (pipe_get(&k))
                 npipe++;
         }
@@ -3354,13 +3418,226 @@ static int create_swapchain(void)
     return 1;
 }
 
+/* The renderer cannot start: never go on headless (THPS 2X player report,
+ * 2026-10-29: an RX 580 whose Windows driver lacks dynamic vertex input ran the
+ * game on without a picture and without a word). The reason goes to the log,
+ * line by line, and into a message box (not with RECOMP_NO_DIALOGS=1, the
+ * automated tests); then the port's fatal handler ends the process, else
+ * exit(1). Only a headless start asked for (RECOMP_VK_HEADLESS=1,
+ * SDL_VIDEODRIVER=offscreen) keeps running without a window. */
+static void vk_fatal(const char *why)
+{
+    char msg[2048];
+    const char *p = why, *nl;
+    const char *nd = getenv("RECOMP_NO_DIALOGS");
+
+#if !defined(__SWITCH__)
+    {
+        /* The device check thread and ready() may both fail: one message. */
+        static SDL_AtomicInt once;
+        if (!SDL_CompareAndSwapAtomicInt(&once, 0, 1))
+            for (;;)
+                SDL_Delay(1000);        /* the first caller ends the process */
+    }
+#endif
+    LOGE("FATAL: the renderer cannot start\n");
+    while (*p) {
+        nl = strchr(p, '\n');
+        if (!nl)
+            nl = p + strlen(p);
+        if (nl > p)
+            fprintf(stderr, "  [VK]   %.*s\n", (int)(nl - p), p);
+        p = *nl ? nl + 1 : nl;
+    }
+    fflush(stderr);
+#if !defined(__SWITCH__)
+    if (s_win && s_win_thread == SDL_GetCurrentThreadID()) {   /* not a black window behind the box */
+        SDL_DestroyWindow(s_win);
+        s_win = NULL;
+    }
+    if (!(nd && *nd == '1')) {
+        int wn = (int)strlen(why);
+        while (wn > 0 && why[wn - 1] == '\n')
+            wn--;
+        snprintf(msg, sizeof msg, "The game cannot start: the graphics card or its driver does not offer what "
+                 "the Vulkan renderer needs.\n\n%.*s%s%s", wn, why, s_fatal_help ? "\n\n" : "",
+                 s_fatal_help ? s_fatal_help : "");
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, s_fatal_title ? s_fatal_title : "Vulkan renderer",
+                                 msg, NULL);
+    }
+#else
+    (void)msg; (void)nd;
+#endif
+    if (s_fatal_handler)
+        s_fatal_handler();
+    exit(1);
+}
+
+/* What the renderer needs from a device: Vulkan 1.3 with dynamic rendering,
+ * push descriptors, a graphics queue, and the swapchain when it has a window.
+ * Dynamic vertex input is optional (vk_dyn_vertex_input; without it the
+ * formats are baked into the pipelines). RECOMP_VK_TEST_MISSING=<extension
+ * name> (tests only) treats that extension as absent, to check this path on
+ * any GPU.
+ * Appends "<device> (driver: Vulkan x.y.z)" and its missing items to why
+ * (when given); returns 1 when nothing is missing. */
+static int vk_device_ok(VkPhysicalDevice pd, int need_swapchain, char *why, size_t nwhy)
+{
+    static const struct { const char *ext, *what; } need[] = {
+        { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "push descriptors" },
+        { VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, "dynamic vertex input" },
+        { VK_KHR_SWAPCHAIN_EXTENSION_NAME, "presenting to a window" },
+    };
+    static VkExtensionProperties ep[512];
+    const char *fake = getenv("RECOMP_VK_TEST_MISSING");
+    VkPhysicalDeviceProperties pp;
+    VkQueueFamilyProperties qf[16];
+    char miss[512];
+    size_t nm = 0;
+    uint32_t ne = 512, nq = 16, i, k;
+    int has[3] = { 0, 0, 0 }, gfx = 0;
+
+    miss[0] = 0;
+#define MISS(...) (nm += (size_t)snprintf(miss + nm, nm < sizeof miss ? sizeof miss - nm : 0, __VA_ARGS__), \
+                   nm = nm < sizeof miss ? nm : sizeof miss - 1)
+    vkGetPhysicalDeviceProperties(pd, &pp);
+    if (pp.apiVersion < VK_API_VERSION_1_3)
+        MISS("  - Vulkan 1.3 (the driver offers %u.%u)\n", VK_API_VERSION_MAJOR(pp.apiVersion),
+             VK_API_VERSION_MINOR(pp.apiVersion));
+    if (vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ep) < 0)
+        ne = 0;
+    for (i = 0; i < ne; i++)
+        for (k = 0; k < 3; k++)
+            if (!strcmp(ep[i].extensionName, need[k].ext) && !(fake && !strcmp(fake, need[k].ext)))
+                has[k] = 1;
+    for (k = 0; k < 3; k++)
+        if (!has[k] && (k == 0 || (k == 2 && need_swapchain)))
+            MISS("  - %s (%s)\n", need[k].ext, need[k].what);
+    if (pp.apiVersion >= VK_API_VERSION_1_3) {
+        VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+        f2.pNext = &f13;
+        vkGetPhysicalDeviceFeatures2(pd, &f2);
+        if (!f13.dynamicRendering)
+            MISS("  - dynamic rendering (Vulkan 1.3 feature)\n");
+    }
+    vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
+    for (i = 0; i < nq; i++)
+        if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+            gfx = 1;
+    if (!gfx)
+        MISS("  - a graphics queue\n");
+#undef MISS
+    if (why) {
+        size_t n = strlen(why);
+        snprintf(why + n, n < nwhy ? nwhy - n : 0, "%s%s (driver: Vulkan %u.%u.%u)\n%s%s", n ? "\n" : "",
+                 pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion),
+                 VK_API_VERSION_PATCH(pp.apiVersion), nm ? "missing:\n" : "", miss);
+    }
+    return nm == 0;
+}
+
+/* 1 when the device offers VK_EXT_vertex_input_dynamic_state with its
+ * feature (RECOMP_VK_TEST_MISSING may name it). */
+static int vk_dyn_vertex_input(VkPhysicalDevice pd)
+{
+    static VkExtensionProperties ep[512];
+    const char *fake = getenv("RECOMP_VK_TEST_MISSING");
+    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT fvi =
+        { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT };
+    uint32_t ne = 512, i;
+    int has = 0;
+
+    if (fake && !strcmp(fake, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))
+        return 0;
+    if (vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ep) < 0)
+        ne = 0;
+    for (i = 0; i < ne && !has; i++)
+        has = !strcmp(ep[i].extensionName, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    if (!has)
+        return 0;
+    f2.pNext = &fvi;
+    vkGetPhysicalDeviceFeatures2(pd, &f2);
+    return fvi.vertexInputDynamicState == VK_TRUE;
+}
+
+/* The first device (in the driver's order, as before) with everything the
+ * renderer needs; 0 when there is none, why then names every device and what
+ * it lacks. */
+static int vk_pick_device(VkInstance inst, int need_swapchain, VkPhysicalDevice *out, char *why, size_t nwhy)
+{
+    VkPhysicalDevice pds[8];
+    uint32_t n = 8, i;
+
+    why[0] = 0;
+    if (vkEnumeratePhysicalDevices(inst, &n, pds) < 0 || !n) {
+        snprintf(why, nwhy, "No Vulkan device was found - is the graphics driver installed?");
+        return 0;
+    }
+    for (i = 0; i < n; i++)
+        if (vk_device_ok(pds[i], need_swapchain, NULL, 0)) {
+            *out = pds[i];
+            return 1;
+        }
+    for (i = 0; i < n; i++)
+        vk_device_ok(pds[i], need_swapchain, why, nwhy);
+    return 0;
+}
+
+/* nv2a_vk_install, before the title starts: the device check on a throw-away
+ * instance, so a GPU without what the renderer needs stops the start at once
+ * -- not later on the NV2A thread, with the title's movies already playing
+ * sound behind the message. ready() checks again on its own instance. It
+ * runs on its own thread (vk_precheck_thread): ~110 ms on the RTX 3050 Ti,
+ * mostly loading the driver, that the start does not wait for. */
+static void vk_precheck(void)
+{
+    VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    VkInstance inst;
+    VkPhysicalDevice pd;
+    static char why[1536];
+    const char *e = getenv("RECOMP_VK_HEADLESS");
+    const char *drv = getenv("SDL_VIDEODRIVER");
+
+#if !defined(__SWITCH__)
+    uint64_t t0 = SDL_GetTicksNS();
+#endif
+
+    if ((e && *e == '1') || (drv && !strcmp(drv, "offscreen")))
+        return;                         /* a headless test run: ready() decides */
+    ai.pApplicationName = "nfsu2x";
+    ai.pEngineName = "xboxrecomp";
+    ai.apiVersion = VK_API_VERSION_1_3;
+    ici.pApplicationInfo = &ai;
+    if (vkCreateInstance(&ici, NULL, &inst) != VK_SUCCESS)
+        vk_fatal("Vulkan could not be started (vkCreateInstance failed) - is a Vulkan driver installed?");
+    if (!vk_pick_device(inst, 1, &pd, why, sizeof why)) {
+        vkDestroyInstance(inst, NULL);
+        vk_fatal(why);
+    }
+    vkDestroyInstance(inst, NULL);
+#if !defined(__SWITCH__)
+    fprintf(stderr, "  [VK] device check passed in %.0f ms\n", (double)(SDL_GetTicksNS() - t0) / 1e6);
+#endif
+}
+
+#if !defined(__SWITCH__)
+static int SDLCALL vk_precheck_thread(void *arg)
+{
+    (void)arg;
+    vk_precheck();
+    return 0;
+}
+#endif
+
 static int ready(void)
 {
     VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     const char *iext[8];
     uint32_t niext = 0, n, i;
-    VkPhysicalDevice pds[8];
     VkPhysicalDeviceProperties pp;
     VkQueueFamilyProperties qf[8];
     float prio = 1.0f;
@@ -3400,8 +3677,9 @@ static int ready(void)
         s_headless = (e && *e == '1') || (drv && !strcmp(drv, "offscreen"));
         if (!s_headless) {
             if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
-                LOGE("SDL_InitSubSystem: %s\n", SDL_GetError());
-                s_headless = 1;
+                char w[512];
+                snprintf(w, sizeof w, "The window system could not be started (SDL: %s).", SDL_GetError());
+                vk_fatal(w);
             } else {
                 /* Host pads (src/input): SDL wants them initialised and
                  * pumped on the thread that owns the window -- vk_flip polls
@@ -3419,9 +3697,11 @@ static int ready(void)
                 int ww = (int)(wh * aspect + 0.5f);
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", ww, wh,
                                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+                s_win_thread = SDL_GetCurrentThreadID();
                 if (!s_win) {
-                    LOGE("SDL_CreateWindow: %s\n", SDL_GetError());
-                    s_headless = 1;
+                    char w[512];
+                    snprintf(w, sizeof w, "The Vulkan window could not be opened (SDL: %s).", SDL_GetError());
+                    vk_fatal(w);
                 } else {
                     int r[4] = { s_wr_want[0], s_wr_want[1], ww, wh };
                     if (!SDL_SetWindowAspectRatio(s_win, aspect, aspect))
@@ -3476,17 +3756,31 @@ static int ready(void)
     ici.ppEnabledLayerNames = layers;
     if (vkCreateInstance(&ici, NULL, &s_inst) != VK_SUCCESS) {
         LOGE("vkCreateInstance failed\n");
-        return 0;
+        if (s_headless)
+            return 0;
+        vk_fatal("Vulkan could not be started (vkCreateInstance failed) - is a Vulkan driver installed?");
     }
-    n = 8;
-    if (vkEnumeratePhysicalDevices(s_inst, &n, pds) != VK_SUCCESS || !n) {
-        LOGE("no Vulkan device\n");
-        return 0;
+    {
+        static char why[1536];
+        if (!vk_pick_device(s_inst, !s_headless, &s_pd, why, sizeof why)) {
+            if (s_headless) {
+                LOGE("no Vulkan device the renderer can use\n");
+                return 0;
+            }
+            vk_fatal(why);
+        }
     }
-    s_pd = pds[0];
     vkGetPhysicalDeviceProperties(s_pd, &pp);
     fprintf(stderr, "  [VK] %s, Vulkan %u.%u.%u\n", pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion),
             VK_API_VERSION_MINOR(pp.apiVersion), VK_API_VERSION_PATCH(pp.apiVersion));
+    {
+        const char *e = getenv("RECOMP_VK_NO_DYN_VERTEX_INPUT");
+        int dyn = vk_dyn_vertex_input(s_pd);
+        s_baked_vi = !dyn || (e && *e == '1');
+        if (s_baked_vi)
+            fprintf(stderr, "  [VK] vertex input baked into the pipelines (%s)\n",
+                    dyn ? "RECOMP_VK_NO_DYN_VERTEX_INPUT=1" : "no " VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    }
     s_ubo_align = pp.limits.minUniformBufferOffsetAlignment;
     s_ubo_range = pp.limits.maxUniformBufferRange;
     {
@@ -3588,8 +3882,9 @@ static int ready(void)
     }
 #else
     if (!s_headless && !SDL_Vulkan_CreateSurface(s_win, s_inst, NULL, &s_surface)) {
-        LOGE("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
-        s_headless = 1;
+        char w[512];
+        snprintf(w, sizeof w, "The window's Vulkan surface could not be created (SDL: %s).", SDL_GetError());
+        vk_fatal(w);
     }
 #endif
 
@@ -3599,7 +3894,8 @@ static int ready(void)
     f13.dynamicRendering = VK_TRUE;
     fvi.vertexInputDynamicState = VK_TRUE;
     feds.extendedDynamicState = VK_TRUE;
-    f13.pNext = &fvi;
+    if (!s_baked_vi)
+        f13.pNext = &fvi;
     f2.pNext = &f13;
     f2.features.textureCompressionBC = s_have_bc ? VK_TRUE : VK_FALSE;
     f2.features.depthClamp = s_have_depth_clamp ? VK_TRUE : VK_FALSE;
@@ -3607,7 +3903,8 @@ static int ready(void)
     if (!s_headless)
         dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
-    dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+    if (!s_baked_vi)
+        dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
     {
         /* Optional: the driver's VRAM budget/usage (render-scale fit, the
          * RECOMP_DEBUG cache line); without it 80 % of the heap is assumed. */
@@ -3627,14 +3924,29 @@ static int ready(void)
     dci.enabledExtensionCount = ndext;
     dci.ppEnabledExtensionNames = dext;
     (void)feds;
-    if (vkCreateDevice(s_pd, &dci, NULL, &s_dev) != VK_SUCCESS) {
-        LOGE("vkCreateDevice failed (needs push descriptors, dynamic vertex input, Vulkan 1.3)\n");
-        return 0;
+    {
+        VkResult vr = vkCreateDevice(s_pd, &dci, NULL, &s_dev);
+        if (vr != VK_SUCCESS) {
+            char w[512];
+            LOGE("vkCreateDevice failed (VkResult %d)\n", (int)vr);
+            if (s_headless)
+                return 0;
+            snprintf(w, sizeof w, "%s (driver: Vulkan %u.%u.%u)\nhas everything the renderer needs, but the "
+                     "driver refused to create the device (VkResult %d). Updating the graphics driver may help.",
+                     pp.deviceName, VK_API_VERSION_MAJOR(pp.apiVersion), VK_API_VERSION_MINOR(pp.apiVersion),
+                     VK_API_VERSION_PATCH(pp.apiVersion), (int)vr);
+            vk_fatal(w);
+        }
     }
     vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
-#define GET(p, name) p = (void *)vkGetDeviceProcAddr(s_dev, name); if (!p) { LOGE("missing %s\n", name); return 0; }
+#define GET(p, name) p = (void *)vkGetDeviceProcAddr(s_dev, name); \
+    if (!p) { LOGE("missing %s\n", name); if (s_headless) return 0; vk_fatal("The driver lacks the function " name "."); }
     GET(p_push_desc, "vkCmdPushDescriptorSetKHR");
-    GET(p_vertex_input, "vkCmdSetVertexInputEXT");
+    if (s_baked_vi) {
+        GET(p_bind_vb2, "vkCmdBindVertexBuffers2");
+    } else {
+        GET(p_vertex_input, "vkCmdSetVertexInputEXT");
+    }
     GET(p_begin_rendering, "vkCmdBeginRendering");
     GET(p_end_rendering, "vkCmdEndRendering");
     GET(p_cull_mode, "vkCmdSetCullMode");
@@ -3647,10 +3959,8 @@ static int ready(void)
     GET(p_stencil_op, "vkCmdSetStencilOp");
 #undef GET
 
-    if (!s_headless && !create_swapchain()) {
-        LOGE("swapchain creation failed; running headless\n");
-        s_headless = 1;
-    }
+    if (!s_headless && !create_swapchain())
+        vk_fatal("The window's swapchain could not be created (the details are in the lines above in the log).");
 
     {
         VkDescriptorSetLayoutBinding b[7];
@@ -4343,6 +4653,20 @@ static VkFormat vertex_format(uint32_t type, uint32_t size)
     return f;
 }
 
+/* s_baked_vi: the vertex formats upload_vertices will bind, for the pipeline
+ * key -- the device format of a direct attribute, float4 for the converted
+ * and the absent ones. */
+static void vertex_formats(const Nv2aRawBatch *b, uint8_t out[NV2A_RAW_ATTRS])
+{
+    uint32_t a;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        VkFormat f = VK_FORMAT_UNDEFINED;
+        if (b->attr_direct & (1u << a))
+            f = vertex_format(b->direct[a].type, b->direct[a].size);
+        out[a] = (uint8_t)(f != VK_FORMAT_UNDEFINED ? f : VK_FORMAT_R32G32B32A32_SFLOAT);
+    }
+}
+
 /* One attribute of vertex v, as the NV2A reads it, into float4. */
 static void attr_to_float4(const Nv2aRawBatch *b, uint32_t a, uint32_t v, float out[4])
 {
@@ -4504,6 +4828,17 @@ static int upload_vertices(const Nv2aRawBatch *b)
             attr[a].format = VK_FORMAT_R32G32B32A32_SFLOAT;
             offs[a] = at + const_at + a * 16;
         }
+    }
+    if (s_baked_vi) {
+        /* The formats are in the pipeline (vertex_formats, same choice as
+         * above); only the strides go with the buffers. */
+        VkDeviceSize strides[NV2A_RAW_ATTRS];
+        for (a = 0; a < NV2A_RAW_ATTRS; a++)
+            strides[a] = bind[a].stride;
+        p_bind_vb2(s_cb, 0, NV2A_RAW_ATTRS / 2, bufs, offs, NULL, strides);
+        p_bind_vb2(s_cb, NV2A_RAW_ATTRS / 2, NV2A_RAW_ATTRS - NV2A_RAW_ATTRS / 2,
+                   bufs + NV2A_RAW_ATTRS / 2, offs + NV2A_RAW_ATTRS / 2, NULL, strides + NV2A_RAW_ATTRS / 2);
+        return 1;
     }
     {
         /* Vertex input is dynamic state: re-send it only when it changed
@@ -4844,6 +5179,8 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     key.depth = d != NULL;
     key.topo = cls;
     key.samples = s->ms;                     /* MSAA: the presented surface's sample count */
+    if (s_baked_vi)
+        vertex_formats(b, key.vfmt);
     pipe = pipe_get(&key);
     if (!pipe)
         return;
@@ -6821,6 +7158,13 @@ void nv2a_vk_set_quit_handler(void (*fn)(void))
     s_quit_handler = fn;
 }
 
+void nv2a_vk_set_fatal_handler(void (*fn)(void), const char *title, const char *help)
+{
+    s_fatal_handler = fn;
+    s_fatal_title = title;
+    s_fatal_help = help;
+}
+
 /* The boot animation (src/bootvideo, before the title starts). The port's
  * thread decodes and hands each frame over (nv2a_vk_boot_frame); the NV2A
  * thread -- it drives the executor, owns the window and pumps its events --
@@ -6988,6 +7332,17 @@ void nv2a_vk_install(void)
     xbox_SetContiguousFreeHook(on_contig_free);
     nv2a_backend_register(&s_backend);
     fprintf(stderr, "[BOOT] NV2A Vulkan renderer registered\n");
+#if !defined(__SWITCH__)
+    {
+        SDL_Thread *t = SDL_CreateThread(vk_precheck_thread, "vk_precheck", NULL);
+        if (t)
+            SDL_DetachThread(t);
+        else
+            vk_precheck();
+    }
+#else
+    vk_precheck();
+#endif
 #if !defined(__SWITCH__)
     {
         extern const char *xbox_getenv_utf8(const char *name);

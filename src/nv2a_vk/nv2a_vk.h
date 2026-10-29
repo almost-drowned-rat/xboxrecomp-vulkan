@@ -14,6 +14,15 @@ void nv2a_vk_install(void);
  * was closed. Set either before nv2a_vk_install; NULL ignores the events. */
 void nv2a_vk_set_key_handler(void (*fn)(int scancode, int down));
 void nv2a_vk_set_quit_handler(void (*fn)(void));
+/* The renderer cannot start (no device with Vulkan 1.3, push descriptors and
+ * dynamic vertex input; no window, surface or swapchain): it never runs on
+ * headless. The reason (each GPU, its driver's Vulkan version and what it
+ * lacks) goes to the log and into a message box titled title, with help as
+ * the last line (e.g. the README's requirements link; NULL = none) -- no box
+ * with RECOMP_NO_DIALOGS=1. Then fn ends the process (NULL: exit(1)).
+ * nv2a_vk_install checks the device at once, so set this before it. Only a
+ * headless start asked for (RECOMP_VK_HEADLESS=1) skips all of this. */
+void nv2a_vk_set_fatal_handler(void (*fn)(void), const char *title, const char *help);
 /* 1 + slot of a drawn-into surface covering the guest address, 0 if none
  * (CPU readback diagnostics). */
 int nv2a_vk_render_target_at(uint32_t va);

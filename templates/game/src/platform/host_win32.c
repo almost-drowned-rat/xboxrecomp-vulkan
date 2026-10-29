@@ -482,6 +482,14 @@ static void open_log(const char *data_dir)
     s_log = _wfopen(wlog, L"w");
     if (!s_log)
         return;
+    /* A GUI-subsystem exe (the player's build) started without inherited
+     * handles - double-clicked, not through the launcher - has no descriptor
+     * behind stdout / stderr (_fileno -2): the _dup2 below would reach nothing
+     * and the log stay empty (THPS 2X, 2026-10-29). Give both one first. */
+    if (_fileno(stdout) < 0)
+        freopen("NUL", "w", stdout);
+    if (_fileno(stderr) < 0)
+        freopen("NUL", "w", stderr);
     if (_pipe(fds, 1 << 16, _O_BINARY) != 0) {
         /* No filter then, but still a log. */
         fclose(s_log);
