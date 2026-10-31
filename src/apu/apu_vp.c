@@ -488,10 +488,16 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case SE2FE_IDLE_VOICE:
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
-            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
-            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
-            d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
-            d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            /* One atomic update: the guest writes FECTL from its own thread
+             * (mcpx_apu_write, without d->lock), and four plain read-modify-
+             * write steps lost a guest write that landed between them and
+             * let the guest read a half-set mode. */
+            uint32_t fectl, trapped;
+            do {
+                fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+                trapped = (fectl & ~(NV_PAPU_FECTL_FEMETHMODE | NV_PAPU_FECTL_FETRAPREASON))
+                          | NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            } while (qatomic_cmpxchg32(&d->regs[NV_PAPU_FECTL], fectl, trapped) != fectl);
             d->set_irq = true;
         }
         break;

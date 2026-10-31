@@ -853,6 +853,15 @@ static void counter_mirrors_tick(void)
     }
     if (irq || InterlockedCompareExchange(&s_vblank_irq_active, 0, 0))
         return;
+    /* One thread at a time: the ack thread and the title's throttle wait
+     * (xbox_GuestFlipWait) both run this. The CAS below kept "completed"
+     * right, but the plain path could retire the same flips twice, and the
+     * ring step in flip_queue_retire (clear the entry, advance the index) and
+     * s_mirror_vb are plain read-modify-writes. A caller that finds the other
+     * one inside skips the pass - it is doing the same work. */
+    static volatile LONG busy;
+    if (InterlockedCompareExchange(&busy, 1, 0) != 0)
+        return;
     for (int i = 0; i < g_counter_mirror_count; i++) {
         uint32_t dev;
 
@@ -901,6 +910,7 @@ static void counter_mirrors_tick(void)
                 flip_queue_retire(dev, g_flip_queue.count);
         }
     }
+    InterlockedExchange(&busy, 0);
 }
 
 /* RECOMP_WAIT_STATS=1: how often the guest waited, per kind, every 5 s. */
@@ -1253,8 +1263,8 @@ void xbox_Nv2aVblankTaken(void)
     volatile uint32_t *nv = (volatile uint32_t *)
         ((uint8_t *)g_memory_offset + 0xFD000000u);
     vblank_set(0);
-    nv[0x000100 / 4] &= ~0x01000000u;             /* PMC_INTR_0: PCRTC */
-    nv[0x600100 / 4] &= ~0x00000001u;             /* PCRTC_INTR_0: vblank */
+    InterlockedAnd((volatile LONG *)&nv[0x000100 / 4], (LONG)~0x01000000u);   /* PMC_INTR_0: PCRTC */
+    InterlockedAnd((volatile LONG *)&nv[0x600100 / 4], (LONG)~0x00000001u);   /* PCRTC_INTR_0: vblank */
 }
 
 static int vblank_held(void)
@@ -1292,15 +1302,20 @@ static void nv2a_ack_flags(volatile uint32_t *regs)
             mask &= ~0x01000000u;
         if (vblank && NV2A_ACK[i].offset == 0x600100)
             mask &= ~0x00000001u;
+        /* Atomic: the executor sets PGRAPH bits of the same words while it
+         * traps, and a plain &= wrote its bit back or ate it (nv2a_pb_exec.c
+         * REG_OR). */
         if (*r & mask) {
-            *r &= ~mask;
+            InterlockedAnd((volatile LONG *)r, (LONG)~mask);
         }
     }
     for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+        /* Atomic: both register threads run this, and the guest writes the
+         * same words. */
         if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
-            *r |= NV2A_IDLE[i].idle_mask;
+            InterlockedOr((volatile LONG *)r, (LONG)NV2A_IDLE[i].idle_mask);
         }
     }
 }
@@ -1342,7 +1357,7 @@ static void spin_ack_flush(void)
         ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x100410u);
     if (*pfb & 0x00010000u) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);  /* its pushbuffer writes first */
-        *pfb &= ~0x00010000u;
+        __atomic_fetch_and(pfb, ~0x00010000u, __ATOMIC_SEQ_CST);  /* the flag thread clears it too */
     }
 }
 
@@ -1370,8 +1385,8 @@ void recomp_spin_wake(void)
 {
     volatile uint32_t *pfb = (volatile uint32_t *)
         ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u + 0x100410u);
-    if (*pfb & 0x00010000u)
-        *pfb &= ~0x00010000u;
+    if (*pfb & 0x00010000u)   /* atomic: the flag thread clears it too */
+        InterlockedAnd((volatile LONG *)pfb, (LONG)~0x00010000u);
     if (s_hw_event && InterlockedCompareExchange(&s_hw_sleepers, 0, 0))
         SetEvent(s_hw_event);
 }

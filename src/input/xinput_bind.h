@@ -121,6 +121,11 @@ int  xbox_InputKeyboardPort(void);
  * (a trigger past half). */
 uint16_t xbox_InputBindHeldKeyboard(void);
 uint16_t xbox_InputBindHeldPad(int port);
+/* Is one source held now: a key (kind keyboard; only while the keyboard
+ * plays on that port) or a pad source on a port (a trigger past half)?
+ * For a port's own actions outside the Xbox controls (e.g. a camera reset):
+ * the port keeps that action's source per device itself. */
+int xbox_InputSourceDown(XboxBindKind kind, int port, uint16_t src);
 /* While on, every port reads as nothing pressed (the title's menus do not see
  * the press being recorded). */
 void xbox_InputBindSuppress(int on);

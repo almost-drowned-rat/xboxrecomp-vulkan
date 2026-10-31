@@ -717,6 +717,22 @@ uint16_t xbox_InputBindHeldPad(int port)
     return got;
 }
 
+int xbox_InputSourceDown(XboxBindKind kind, int port, uint16_t src)
+{
+    int down = 0;
+    if (!src)
+        return 0;
+    if (kind == XBOX_BIND_KEYBOARD)
+        return port == xbox_InputKeyboardPort() && src < KEY_SLOTS && key_down(src);
+    if (port < 0 || port >= XBOX_MAX_CONTROLLERS || src >= XBOX_PAD_SRC_COUNT)
+        return 0;
+    lock();
+    if (g_pads[port])
+        down = pad_value(g_pads[port], src) > 127;
+    unlock();
+    return down;
+}
+
 void xbox_InputBindSuppress(int on)
 {
     s_bind_suppress = on ? 1 : 0;

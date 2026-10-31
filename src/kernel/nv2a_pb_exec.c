@@ -4132,6 +4132,17 @@ void nv2a_pb_trap_unlock(void)
     InterlockedExchange(&s_trap_lock, 0);
 }
 
+/* Bits of the interrupt-status words, set and cleared atomically. The
+ * register threads clear the other bits of the same words at the same time
+ * (xbox_memory_layout.c nv2a_ack_flags), and a plain |= or &= is a read and
+ * a write: the executor re-asserting PGRAPH in its trap loop wrote back the
+ * vblank bit the flag thread had just cleared, so PMC_INTR bit 24 never
+ * dropped, D3D's DPC (0x00356BF0) spun on it for good, and the trap it
+ * should have taken next stayed pending -- the Burnout 3 race freeze with
+ * the swap-interval hold, which puts the traps right after the vblank. */
+#define REG_OR(p, v)  InterlockedOr((volatile LONG *)(p), (LONG)(v))
+#define REG_AND(p, v) InterlockedAnd((volatile LONG *)(p), (LONG)(v))
+
 /* Under the lock, after a handler call that found NSOURCE set: that is the
  * trap acknowledged, so clear what the write-1-to-clear would have. */
 void nv2a_pb_trap_taken(void)
@@ -4139,8 +4150,8 @@ void nv2a_pb_trap_taken(void)
     volatile uint32_t *nv = (volatile uint32_t *)
         ((uint8_t *)xbox_GetMemoryOffset() + 0xFD000000u);
     nv[0x400108 / 4] = 0;              /* NSOURCE */
-    nv[0x400100 / 4] &= ~1u;           /* PGRAPH_INTR */
-    nv[0x000100 / 4] &= ~0x1000u;      /* PMC_INTR_0: PGRAPH */
+    REG_AND(&nv[0x400100 / 4], ~1u);   /* PGRAPH_INTR */
+    REG_AND(&nv[0x000100 / 4], ~0x1000u);  /* PMC_INTR_0: PGRAPH */
     InterlockedExchange(&s_trap_taken, 1);
     SetEvent(driver_event());
 }
@@ -4160,8 +4171,8 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
     nv[0x400704 / 4] = method | (subch << 16);    /* TRAPPED_ADDR */
     nv[0x400708 / 4] = param;                      /* TRAPPED_DATA */
     nv[0x400108 / 4] = 1;                          /* NSOURCE */
-    nv[0x400100 / 4] |= 1;                         /* PGRAPH_INTR */
-    nv[0x000100 / 4] |= 0x1000;                    /* PMC_INTR_0: PGRAPH */
+    REG_OR(&nv[0x400100 / 4], 1);                  /* PGRAPH_INTR */
+    REG_OR(&nv[0x000100 / 4], 0x1000);             /* PMC_INTR_0: PGRAPH */
     InterlockedExchange(&s_trap_lock, 0);
     xbox_set_irq_line(3, 1);
     /* PGRAPH stalls until the driver has taken the trap, however long. */
@@ -4171,8 +4182,8 @@ static void trap_deliver_hooked(volatile uint32_t *nv, uint32_t method,
          * bits after; under the lock, so a taken trap is never re-raised. */
         if (InterlockedCompareExchange(&s_trap_lock, 1, 0) == 0) {
             if (!InterlockedCompareExchange(&s_trap_taken, 0, 0)) {
-                nv[0x400100 / 4] |= 1;
-                nv[0x000100 / 4] |= 0x1000;
+                REG_OR(&nv[0x400100 / 4], 1);
+                REG_OR(&nv[0x000100 / 4], 0x1000);
             }
             InterlockedExchange(&s_trap_lock, 0);
         }
@@ -4287,8 +4298,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         nv[0x400708 / 4] = param;                      /* TRAPPED_DATA */
         nv[0x400108 / 4] = 1;                          /* NSOURCE */
         nv[0x400720 / 4] = 2;                          /* FIFO: sentinel */
-        nv[0x400100 / 4] |= 1;                         /* PGRAPH_INTR */
-        nv[0x000100 / 4] |= 0x1000;                    /* PMC_INTR_0: PGRAPH */
+        REG_OR(&nv[0x400100 / 4], 1);                  /* PGRAPH_INTR */
+        REG_OR(&nv[0x000100 / 4], 0x1000);             /* PMC_INTR_0: PGRAPH */
         xbox_set_irq_line(3, 1);
         /* Entered: the handler writes 0 over the sentinel first thing, then
          * reads the status. Done: it writes 1 on the way out -- but with the
@@ -4306,8 +4317,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             /* Level, like the hardware: asserted until taken. Re-asserting
              * also closes the window where the ack thread read "not held" a
              * moment before the hold went up and cleared the bits after. */
-            nv[0x400100 / 4] |= 1;
-            nv[0x000100 / 4] |= 0x1000;
+            REG_OR(&nv[0x400100 / 4], 1);
+            REG_OR(&nv[0x000100 / 4], 0x1000);
             if (GetTickCount64() > give_up) {
                 fprintf(stderr, "  [PB] NOP(%u) trap still pending after 2 s "
                         "(PMC_INTR %08X EN %08X)\n", param, nv[0x100 / 4],
@@ -4324,7 +4335,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * again -- thousands of times per trap in NFSU2, until D3D's flip
          * targets were millions of vblanks ahead and PersistDisplay, which
          * waits for the pending flips to retire, never returned. */
-        nv[0x000100 / 4] &= ~0x1000u;
+        REG_AND(&nv[0x000100 / 4], ~0x1000u);
         xbox_set_irq_line(3, 0);
         if (nv[0x400720 / 4] != 2) {
             ULONGLONG grace = GetTickCount64() + 2;
@@ -4345,9 +4356,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                         xbox_IrqlRaisedCount());
             }
         }
-        nv[0x400100 / 4] &= ~1u;
+        REG_AND(&nv[0x400100 / 4], ~1u);
         nv[0x400108 / 4] = 0;
-        nv[0x000100 / 4] &= ~0x1000u;
+        REG_AND(&nv[0x000100 / 4], ~0x1000u);
         nv[0x400720 / 4] = 1;
         xbox_set_irq_line(3, 0);
         xbox_Nv2aHoldInterrupts(0);

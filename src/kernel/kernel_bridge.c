@@ -2437,8 +2437,10 @@ static void kernel_vblank_tick(void)
         return;
 
     xbox_Nv2aVblankHold();
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    /* Atomic: the executor and the flag thread change other bits of the same
+     * words at the same time (nv2a_pb_exec.c REG_OR). */
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0), NV2A_PCRTC_INTR_VBLANK);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0), NV2A_PMC_INTR_PCRTC);
 
     {
         static unsigned n;

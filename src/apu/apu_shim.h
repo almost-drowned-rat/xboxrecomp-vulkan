@@ -36,6 +36,16 @@
 #endif
 #endif
 
+/* 32-bit compare-and-swap; returns the value that was there. */
+#ifndef qatomic_cmpxchg32
+#ifdef _MSC_VER
+#define qatomic_cmpxchg32(ptr, old, new) \
+    ((uint32_t)_InterlockedCompareExchange((long volatile*)(ptr), (long)(new), (long)(old)))
+#else
+#define qatomic_cmpxchg32(ptr, old, new) __sync_val_compare_and_swap((ptr), (old), (new))
+#endif
+#endif
+
 /* ============================================================
  * QEMU clock helpers (beyond what NV2A shim provides)
  * ============================================================ */

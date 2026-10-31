@@ -1826,12 +1826,31 @@ static uint32_t bytes_hash_full(uint32_t va, uint32_t bytes)
     return (uint32_t)(a ^ (a >> 32));
 }
 
+/* Bytes per texel of the uncompressed NV2A colour formats (xemu's
+ * kelvin_color_format_info_map, hw/xbox/nv2a/pgraph/texture.c); 0 = not in
+ * it (counted as 4, as before). Every 16-bit format used to be counted as 4:
+ * a 16-bit cube map's faces then sat twice as far apart as the title stores
+ * them, so faces 1-5 came from the wrong memory (THPS 2X's Hangar cube, R5G6B5
+ * 256x256 with 9 levels: block garbage on water, glass and metal, GitHub issue
+ * #2), and 2D textures were hashed over too many bytes. */
+static uint32_t tex_bpp(uint32_t color)
+{
+    static const uint8_t bpp[0x42] = {
+        [0x00] = 1, [0x01] = 1, [0x02] = 2, [0x03] = 2, [0x04] = 2, [0x05] = 2, [0x06] = 4, [0x07] = 4,
+        [0x0B] = 1, [0x10] = 2, [0x11] = 2, [0x12] = 4, [0x13] = 1, [0x17] = 2, [0x19] = 1, [0x1A] = 2,
+        [0x1B] = 1, [0x1C] = 2, [0x1D] = 2, [0x1E] = 4, [0x1F] = 1, [0x20] = 2, [0x24] = 2, [0x25] = 2,
+        [0x27] = 2, [0x28] = 2, [0x29] = 2, [0x2C] = 2, [0x2E] = 4, [0x2F] = 4, [0x30] = 2, [0x31] = 2,
+        [0x35] = 2, [0x3A] = 4, [0x3B] = 4, [0x3C] = 4, [0x3F] = 4, [0x40] = 4, [0x41] = 4,
+    };
+    return color < sizeof bpp && bpp[color] ? bpp[color] : 4;
+}
+
 static uint32_t tex_bytes(uint32_t color, uint32_t w, uint32_t h, uint32_t pitch)
 {
     if (color == 0x0C) return ((w + 3) / 4) * ((h + 3) / 4) * 8;
     if (color == 0x0E || color == 0x0F) return ((w + 3) / 4) * ((h + 3) / 4) * 16;
     if (pitch) return pitch * h;
-    return w * h * 4;
+    return w * h * tex_bpp(color);
 }
 
 static uint32_t swizzle_index(uint32_t u, uint32_t v, uint32_t w, uint32_t h)
@@ -2418,6 +2437,27 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
             int any = 0;
             for (f = 0; f < 6; f++)
                 any |= (faces[f] = surf_find(va + f * face)) != NULL;
+            {
+                /* RECOMP_CUBE_LOG=1 (diagnosis, GitHub issue #2): each cube
+                 * map once - its format word, the face stride and which faces
+                 * a render surface claims */
+                static int cl = -1;
+                static uint32_t seen[16];
+                uint32_t k;
+                if (cl < 0) {
+                    const char *e = getenv("RECOMP_CUBE_LOG");
+                    cl = e && *e == '1';
+                }
+                for (k = 0; cl && k < 16 && seen[k] && seen[k] != va; k++)
+                    ;
+                if (cl && k < 16 && !seen[k]) {
+                    seen[k] = va;
+                    LOGE("cube 0x%08X format 0x%08X color %02X %ux%u levels %u face %u surfaces %d%d%d%d%d%d\n",
+                         va, format, color, w, h, (format >> 16) & 0xF, face, faces[0] != NULL,
+                         faces[1] != NULL, faces[2] != NULL, faces[3] != NULL, faces[4] != NULL,
+                         faces[5] != NULL);
+                }
+            }
             if (any) {
                 out->imageView = cube_from_surfaces(va, w, h, face, faces);
                 levels = s_mips ? 2 : 1;            /* has a chain: see below */

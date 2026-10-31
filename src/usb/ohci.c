@@ -172,6 +172,22 @@ static int s_npads = 1;          /* RECOMP_USB_PADS */
 static int s_enabled;
 static int s_trace;
 
+/* Setting and clearing register bits, atomically.
+ *
+ * Two threads change the same registers: the guest's writes (ohci_write, on
+ * the guest thread in the MMIO fault handler) and the controller thread
+ * below. A plain |= or &= from one of them could write back a bit the other
+ * had just changed - the driver's write-1-to-clear eating a WritebackDoneHead
+ * the controller had just raised, or the controller's "ControlListFilled
+ * consumed" eating the driver's next one - and a lost bit is a transfer that
+ * never completes. The same class as the PMC_INTR bit (nv2a_pb_exec.c REG_OR).
+ * Interlocked rather than a lock: the controller thread calls the ISR, which
+ * writes these registers from inside the call. */
+static void reg_or(uint32_t *r, uint32_t v)  { InterlockedOr((volatile LONG *)r, (LONG)v); }
+static void reg_and(uint32_t *r, uint32_t v) { InterlockedAnd((volatile LONG *)r, (LONG)v); }
+#define HC_OR(hc, off, v)  reg_or(&(hc)->reg[(off) / 4], (v))
+#define HC_AND(hc, off, v) reg_and(&(hc)->reg[(off) / 4], (v))
+
 static uint32_t *reg_of(OhciController *hc, uint32_t off)
 {
     return (off < OHCI_REG_MAX) ? &hc->reg[off / 4] : NULL;
@@ -242,12 +258,12 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * a driver polls for exactly that. Leaving it set is a hang, and it
          * is the first thing a driver does, so it would be the only thing
          * anyone ever saw of this file. */
-        *r |= v;
+        reg_or(r, v);
         if (*r & CS_HCR) {
-            *r &= ~CS_HCR;
-            hc->reg[HcControl / 4] &= ~0xC0u;    /* back to UsbReset state  */
-            hc->reg[HcInterruptStatus / 4] = 0;
-            hc->reg[HcInterruptEnable / 4] = 0;
+            reg_and(r, ~CS_HCR);
+            HC_AND(hc, HcControl, ~0xC0u);       /* back to UsbReset state  */
+            InterlockedExchange((volatile LONG *)&hc->reg[HcInterruptStatus / 4], 0);
+            InterlockedExchange((volatile LONG *)&hc->reg[HcInterruptEnable / 4], 0);
         }
         return;
 
@@ -267,16 +283,16 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
                 wr32(hcca + HCCA_DONE_HEAD, 0);
             hc->reg[HcDoneHead / 4] = 0;
         }
-        *r &= ~v;                       /* write 1 to clear                 */
+        reg_and(r, ~v);                 /* write 1 to clear                 */
         hc->ack_seq++;
         return;
 
     case HcInterruptEnable:
-        hc->reg[HcInterruptEnable / 4] |= v;
+        HC_OR(hc, HcInterruptEnable, v);
         return;
 
     case HcInterruptDisable:
-        hc->reg[HcInterruptEnable / 4] &= ~v;
+        HC_AND(hc, HcInterruptEnable, ~v);
         return;
 
     case HcFmNumber:
@@ -318,12 +334,12 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
          * reset the port again, and enumeration looped forever one step from
          * finishing. The port looked healthy the whole time: connected,
          * enabled, powered. */
-        *ps &= ~(v & 0xFFFF0000u);
+        reg_and(ps, ~(v & 0xFFFF0000u));
 
-        if (v & PORT_W_CCS_CLEAR_ENABLE) *ps &= ~PORT_PES;
-        if (v & PORT_W_PES_SET_ENABLE)   *ps |= (*ps & PORT_CCS) ? PORT_PES : 0;
-        if (v & PORT_W_PPS_SET_POWER)    *ps |= PORT_PPS;
-        if (v & PORT_W_CLEAR_POWER)      *ps &= ~PORT_PPS;
+        if (v & PORT_W_CCS_CLEAR_ENABLE) reg_and(ps, ~PORT_PES);
+        if ((v & PORT_W_PES_SET_ENABLE) && (*ps & PORT_CCS)) reg_or(ps, PORT_PES);
+        if (v & PORT_W_PPS_SET_POWER)    reg_or(ps, PORT_PPS);
+        if (v & PORT_W_CLEAR_POWER)      reg_and(ps, ~PORT_PPS);
         if (v & PORT_W_PRS_SET_RESET) {
             /* Reset completes immediately -- there is no wire to settle -- so
              * PRS is never observed set. What matters is what the driver
@@ -336,9 +352,9 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
              * stack from here would overwrite the stack pointer of the thread
              * being interrupted. */
             if (*ps & PORT_CCS)
-                *ps |= PORT_PES;
-            *ps |= PORT_PRSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                reg_or(ps, PORT_PES);
+            reg_or(ps, PORT_PRSC);
+            HC_OR(hc, HcInterruptStatus, INTR_RHSC);
         }
         return;
     }
@@ -770,7 +786,7 @@ static void ohci_publish_done(OhciController *hc, uint32_t done_head)
     if (hcca)
         wr32(hcca + HCCA_DONE_HEAD, done_head);
     hc->reg[HcDoneHead / 4] = done_head;
-    hc->reg[HcInterruptStatus / 4] |= INTR_WDH;
+    HC_OR(hc, HcInterruptStatus, INTR_WDH);
 }
 
 /* Both runners add to the caller's done queue rather than publishing their
@@ -954,7 +970,7 @@ static void ohci_raise(OhciController *hc, uint32_t source)
     uint32_t enable = hc->reg[HcInterruptEnable / 4];
     int claimed;
 
-    hc->reg[HcInterruptStatus / 4] |= source;
+    HC_OR(hc, HcInterruptStatus, source);
 
     if (!(enable & INTR_MIE) || !(enable & source))
         return;
@@ -1100,8 +1116,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             const char *pspec = getenv("RECOMP_USB_PORT");
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
-            hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-            hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+            HC_OR(hc, HcRhPortStatus1 + port * 4, PORT_CCS | PORT_CSC);
+            HC_OR(hc, HcInterruptStatus, INTR_RHSC);
             plugged = 1;
             s_plugged_pads = 1;
             first_port = port;
@@ -1118,8 +1134,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             && usb_gamepad_configured(s_plugged_pads - 1)) {
             if (++settle > 50) {                 /* ~1 s after the last */
                 unsigned port = (first_port + (unsigned)s_plugged_pads) % s_ndp;
-                hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
-                hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+                HC_OR(hc, HcRhPortStatus1 + port * 4, PORT_CCS | PORT_CSC);
+                HC_OR(hc, HcInterruptStatus, INTR_RHSC);
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
                         s_plugged_pads + 1, port + 1, 10);
                 fflush(stderr);
@@ -1151,7 +1167,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
                 wr32(hcca + 0x80, hc->reg[HcFmNumber / 4]);
-            hc->reg[HcInterruptStatus / 4] |= INTR_SF;
+            HC_OR(hc, HcInterruptStatus, INTR_SF);
         }
 
         /* Be the bus master. ControlListEnable in HcControl says the driver
@@ -1193,13 +1209,13 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          && guest_ok(hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_walk_eds(hc, hc->reg[HcBulkHeadED / 4] & ED_PTR_MASK,
                               &pass_done))
-                hc->reg[HcCommandStatus / 4] &= ~0x04u;   /* BLF consumed */
+                HC_AND(hc, HcCommandStatus, ~0x04u);   /* BLF consumed */
         }
 
         if ((control & 0x10u)
          && guest_ok(hc->reg[HcControlHeadED / 4] & ED_PTR_MASK, 16)) {
             if (ohci_run_control_list(hc, &pass_done))
-                hc->reg[HcCommandStatus / 4] &= ~0x02u;   /* CLF consumed */
+                HC_AND(hc, HcCommandStatus, ~0x02u);   /* CLF consumed */
         }
 
         /* One done queue per pass, covering all three lists.
