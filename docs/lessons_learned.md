@@ -510,3 +510,64 @@ new one at the milestone it was found. Workflow: [porting_guide.md](porting_guid
   (`zip_extract_to_file`): the 64 MB in-memory cap of `zip_extract` is for shader packs, libLLVM-23.dll alone is 78 MB.
 - **A message must not guess:** "no internet?" was a guess from a failed process start. Carry the real cause up to
   the box (and into `data\launcher.log`).
+
+## M6 / v1.0 – gameplay patches, play tests, the release (THPS 2X, 2026-10-31)
+
+### Instrument a decision without a relift: override the callee, key on the return address
+- **Situation:** the wall-ride check sits in the middle of a 3,000-line lifted function (`sub_000AC9D0`); a hook there
+  needs a relift. But every branch of it calls small helpers (normalize, dot product, the bail function).
+- **Way:** override the *callee* (weak symbol, `sub_X` calls `sub_X_gen`) and act only when `GUEST32(g_esp)` is the
+  return address inside the caller you care about. The THPS wall trace logs velocity, normal and the angle from the
+  dot product's override (`ret == 0x000AD3F2`), and NO WALL BAIL drops only the bail called from `0x000AD6FB` after a
+  failed angle test - all other callers of the bail are untouched. No relift, a 3-second build.
+- **Caller registers are not visible** in an override when the caller keeps them in locals (`ebp` in the lifted
+  C): use what the callee receives (registers / stack args), or a global that holds the same object.
+- **Calling a guest function from C:** push a return address yourself (`g_esp -= 4; GUEST32(g_esp) = <any>;`), set
+  the register arguments, call, read `g_eax`; save and restore every guest register you touch (`g_esi` etc.).
+
+### Play tests with the maintainer: trace flags + a live log, not guesses
+- Gameplay rules (a wall-ride angle, a camera feel) are decided by playing. Give the build an env trace
+  (`THPS_WALL_TRACE=1`, `THPS_BAIL_TRACE=1`) whose lines say *what decided* (which test, which value), start the
+  session for him windowed, and follow `data\<game>.log` live (it carries stderr; a stderr pipe stays empty).
+  33 wall contacts in 5 minutes gave the exact limit (60 degrees, `|dot| >= 0xDDB`) - his estimate was "60-70".
+- Ask him to play in **separated series** (a pause or RETRY between them) so log lines map to attempts.
+- **Measure before you design the option:** an earlier scripted wall test only ever hit a *different* bail (the
+  grind-balance one) - the real case needed a human at the controls.
+
+### Verify units by reading the consumers, never by assuming
+- The free camera wrapped its yaw at +-2048 because "4096 = 360 degrees" was assumed. The game's consumers take the
+  low word, `>> 1`, `& 0xFFF` into a 4096-entry sine table: **one turn = 8192**. At slow speed nobody noticed; at
+  high speed the camera flipped 180 degrees every few frames and looked "stuck". Read every user of a field first.
+
+### A faster input can expose a follower (camera slerp, smoothing)
+- Game cameras rarely jump to their target: THPS 2X slerps the orientation `t/4096` of the way per frame and hangs
+  the position rigidly on it, with wall probes before the slerp. Turned faster than ~80 degrees/s the camera fell
+  50+ degrees behind, swung its arm into the level and the probes pushed it back ("invisible wall").
+- Fix: raise the follower's step **only while the player drives it** (and a short tail after), scaled with the
+  speed; the game's own collision probes keep running. Find the follower first (a static read
+  took minutes).
+
+### Menu values: the key the menu writes must be the key the reader reads
+- `#define VAL(a, n) { "LABEL " #a, "key_" #a "_p" #n ... }` stringified the *label* letter (`X`) into the settings
+  key, the camera read `key_x_...`: the menu "worked", nothing happened. Separate macro arguments for label and key,
+  keys lower case, and check `settings.ini` after a menu test, not only the screen.
+- A value table sized for 5 values (`val[5]`) needs widening before a 0-10 scale; grep for fixed loops over it.
+
+### Two screens can do "the same" thing - prove which one runs
+- THPS 2X has two Select Level implementations; the first override (found by a static read) never ran in Free
+  Skate. A one-line log in each candidate on the next build settles it in one play test; add it before telling the
+  player to test.
+- Original "always open" rules hide in a helper, not in the gate: Free Skate counted the first level of every part
+  open via `sub_00076A10` before the level gate ran.
+
+### Public release of a private repo: 3-way merge per file, then scan
+- Each public update = the files changed since the last public base, 3-way merged (public old, private old base,
+  private new) with **line endings normalised first** (every toolkit file "conflicted" only on CRLF vs LF). Earlier
+  public scrubs survive the merge; new private references (evidence paths, internal docs, branch names, machine
+  specifics such as monitor ids) are scrubbed by hand, then `git grep` over the whole staged tree.
+- A private helper that knows the machine (`stream_check.ps1` with display-profile names) gets a neutral public
+  twin with the same functions instead of being dropped (the public scripts dot-source it).
+- End-user test before publishing: unzip, launcher first start, a short direct run; the version line in the log
+  names the exact source commits that go public.
+- A new save feature: load a save made by the new build in the previous release before claiming anything about
+  compatibility in the changelog.

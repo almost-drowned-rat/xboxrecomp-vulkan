@@ -202,6 +202,14 @@ int xbox_GuestHz(void);
 int64_t xbox_GuestNsToNextVblank(void);
 /* The display's vblank count, a fixed 60 Hz (titles that count vblanks for time). */
 uint64_t xbox_DisplayVblankCount(void);
+/* FRAME PACING Display: the renderer hands over its native window (creation,
+ * display change); on a display at 120 / 180 / 240 Hz the guest vblank and the
+ * 60 Hz count then follow the display's own vblank. RECOMP_FRAME_PACING=timer
+ * keeps the 60 Hz timer. */
+void xbox_GuestDisplayPacing(void *native_window);
+/* RECOMP_PACING_STATS=1: the renderer after each present; a histogram of the
+ * display refreshes per presented frame every 10 s (also with the timer). */
+void xbox_GuestPresentNote(void);
 /* A high-resolution sleep for game overrides that replace a title's spin. */
 void xbox_GuestSleepNs(uint64_t ns);
 

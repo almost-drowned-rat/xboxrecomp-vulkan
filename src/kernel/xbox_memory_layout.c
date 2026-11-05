@@ -16,6 +16,8 @@
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "platform/host_wait.h"
+#include "platform/host_vblank.h" /* FRAME PACING Display */
+#include <math.h>
 #include "frame_time.h"           /* xbox_ft_vblank_wait: flip waits in the renderer's lines */
 #include <stdio.h>
 #include <stdlib.h>
@@ -738,9 +740,49 @@ static void flip_queue_retire(uint32_t dev, uint32_t n)
 
 /* ---- guest vblank clock ------------------------------------------------- */
 
+/* Two sources (FRAME PACING, maintainer 2026-11-05):
+ *   timer    the guest vblank every 1/hz s of the host clock (as before)
+ *   display  on a display at 120 Hz or more whose rate is a whole multiple of
+ *            the guest rate: every n-th vblank of the display itself
+ *            (platform/host_vblank.h, a thread below), so a game frame stays
+ *            on screen exactly n refreshes; a timer drifted against the
+ *            refresh and showed frames for n-1 and n+1 refreshes in turn
+ * The 60 Hz display count (xbox_DisplayVblankCount, game time) follows the
+ * display the same way while it paces (every m-th refresh, m = refresh / 60),
+ * so game time and frames cannot drift apart. Every change of source or rate
+ * re-bases the counts, which stay monotonic. RECOMP_FRAME_PACING=timer keeps
+ * the timer (the port's FRAME PACING line sets it; default display). */
 static int64_t  s_vb_period_ns = -1;   /* 0 = off */
 static uint64_t s_vb_t0_ns;
-static uint64_t s_vb_base;              /* vblanks counted before s_vb_t0_ns */
+static uint64_t s_vb_base;              /* vblanks counted before the rebase */
+static int      s_vb_hz;                /* the guest rate asked for */
+static int      s_vb_disp_n;            /* > 0: every n-th display vblank since s_vb_r0 */
+static uint64_t s_vb_r0;
+
+static uint64_t s_d60_base, s_d60_t0, s_d60_r0;
+static int      s_d60_m;                /* > 0: every m-th display vblank since s_d60_r0 */
+
+static volatile uint64_t s_dv_count;    /* display vblanks seen (the pacing thread) */
+static volatile uint64_t s_dv_last_ns;  /* when the last one was seen */
+static volatile int64_t  s_dv_period_ns;/* the display's refresh period, measured */
+static int               s_dv_hz;       /* its whole rate while it paces, 0 = it does not */
+
+/* Seqlock over the fields above that a rebase changes (writers: the game's
+ * xbox_GuestSetHz, the pacing thread; readers: every count and wait). */
+static volatile LONG s_clk_seq, s_clk_wr;
+
+static void clk_write_begin(void)
+{
+    while (InterlockedCompareExchange(&s_clk_wr, 1, 0) != 0)
+        host_sleep_ns(50000);
+    InterlockedIncrement(&s_clk_seq);         /* odd: being written */
+}
+
+static void clk_write_end(void)
+{
+    InterlockedIncrement(&s_clk_seq);
+    InterlockedExchange(&s_clk_wr, 0);
+}
 
 static uint64_t host_now_ns(void)
 {
@@ -753,6 +795,7 @@ static int64_t vb_period(void)
         const char *e = getenv("RECOMP_GUEST_HZ");
         int hz = e ? atoi(e) : 60;
         s_vb_t0_ns = host_now_ns();
+        s_vb_hz = hz > 0 ? hz : 0;
         s_vb_period_ns = hz > 0 ? (int64_t)(1000000000ll / hz) : 0;
         if (hz > 0)
             fprintf(stderr, "  Guest vblank: %d Hz (flips retire once per vblank)\n", hz);
@@ -760,10 +803,49 @@ static int64_t vb_period(void)
     return s_vb_period_ns;
 }
 
+/* The guest count, the caller inside a consistent read (seqlock). */
+static uint64_t vb_count_raw(uint64_t now)
+{
+    if (s_vb_disp_n > 0)
+        return s_vb_base + (s_dv_count - s_vb_r0) / (uint64_t)s_vb_disp_n;
+    return s_vb_base + (now - s_vb_t0_ns) / (uint64_t)s_vb_period_ns;
+}
+
+static uint64_t d60_count_raw(uint64_t now)
+{
+    if (s_d60_m > 0)
+        return s_d60_base + (s_dv_count - s_d60_r0) / (uint64_t)s_d60_m;
+    return s_d60_base + (now - s_d60_t0) / 16666667ull;
+}
+
 uint64_t xbox_GuestVblankCount(void)
 {
     int64_t p = vb_period();
-    return p ? s_vb_base + (host_now_ns() - s_vb_t0_ns) / (uint64_t)p : 0;
+    LONG q;
+    uint64_t v;
+    if (!p)
+        return 0;
+    do {
+        q = InterlockedCompareExchange(&s_clk_seq, 0, 0);
+        v = vb_count_raw(host_now_ns());
+    } while ((q & 1) || q != InterlockedCompareExchange(&s_clk_seq, 0, 0));
+    return v;
+}
+
+/* The source for the guest rate now (under clk_write_begin): the display when
+ * it paces and its rate is n x the guest rate (n 1..4), else the timer. */
+static void vb_choose_source(uint64_t now)
+{
+    int n = 0;
+    if (s_dv_hz > 0 && s_vb_hz > 0 && s_dv_hz % s_vb_hz == 0)
+        n = s_dv_hz / s_vb_hz;
+    if (n > 4)
+        n = 0;
+    s_vb_disp_n = n;
+    if (n)
+        s_vb_r0 = s_dv_count;
+    else
+        s_vb_t0_ns = now;
 }
 
 /* A new guest vblank rate from now on, for a title whose contexts want
@@ -774,39 +856,278 @@ uint64_t xbox_GuestVblankCount(void)
 void xbox_GuestSetHz(int hz)
 {
     int64_t p = vb_period(), np;
+    uint64_t now;
     if (!p || hz <= 0)
         return;
     np = (int64_t)(1000000000ll / hz);
     if (np == p)
         return;
-    s_vb_base = xbox_GuestVblankCount();
-    s_vb_t0_ns = host_now_ns();
+    clk_write_begin();
+    now = host_now_ns();
+    s_vb_base = vb_count_raw(now);
     s_vb_period_ns = np;
+    s_vb_hz = hz;
+    vb_choose_source(now);
+    clk_write_end();
 }
 
 /* The display's vblank count: a fixed 60 Hz from the same start as the guest
  * vblank, whatever rate that runs at (xbox_GuestSetHz) -- on the console the
  * display stays at 60 Hz while a title skips frames. For titles that time
  * themselves by counting vblanks (D3D GetDisplayFieldStatus's VBlankCount;
- * THPS 2X's clocks and game time). */
+ * THPS 2X's clocks and game time). While the display paces, every m-th of its
+ * refreshes (see above). */
 uint64_t xbox_DisplayVblankCount(void)
 {
-    /* Its own start: xbox_GuestSetHz re-bases the guest clock. */
-    static uint64_t t0;
-    if (!t0)
-        t0 = host_now_ns();
-    return (host_now_ns() - t0) / 16666667ull;
+    LONG q;
+    uint64_t v;
+    if (!s_d60_t0) {                          /* its own start (first use) */
+        clk_write_begin();
+        if (!s_d60_t0)
+            s_d60_t0 = host_now_ns();
+        clk_write_end();
+    }
+    do {
+        q = InterlockedCompareExchange(&s_clk_seq, 0, 0);
+        v = d60_count_raw(host_now_ns());
+    } while ((q & 1) || q != InterlockedCompareExchange(&s_clk_seq, 0, 0));
+    return v;
 }
 
-/* Nanoseconds to the next guest vblank (0 when off). */
+/* Nanoseconds to the next guest vblank (0 when off). While the display paces:
+ * from the last display vblank and the measured period, at least 0.25 ms (a
+ * vblank a little late must not turn the waits into a spin). */
 int64_t xbox_GuestNsToNextVblank(void)
 {
-    int64_t p = vb_period();
+    int64_t p = vb_period(), ns;
+    LONG q;
     uint64_t now;
     if (!p)
         return 0;
-    now = host_now_ns() - s_vb_t0_ns;
-    return (int64_t)((now / (uint64_t)p + 1) * (uint64_t)p - now);
+    do {
+        q = InterlockedCompareExchange(&s_clk_seq, 0, 0);
+        now = host_now_ns();
+        if (s_vb_disp_n > 0) {
+            uint64_t k = (uint64_t)s_vb_disp_n - (s_dv_count - s_vb_r0) % (uint64_t)s_vb_disp_n;
+            ns = (int64_t)(s_dv_last_ns + k * (uint64_t)s_dv_period_ns) - (int64_t)now;
+            if (ns < 250000)
+                ns = 250000;
+            if (ns > (int64_t)s_vb_disp_n * s_dv_period_ns)
+                ns = (int64_t)s_vb_disp_n * s_dv_period_ns;
+        } else {
+            uint64_t t = now - s_vb_t0_ns;
+            ns = (int64_t)((t / (uint64_t)s_vb_period_ns + 1) * (uint64_t)s_vb_period_ns - t);
+        }
+    } while ((q & 1) || q != InterlockedCompareExchange(&s_clk_seq, 0, 0));
+    return ns;
+}
+
+/* ---- FRAME PACING Display: the pacing thread ---------------------------- */
+
+static void *volatile s_dp_window;      /* the native window (xbox_GuestDisplayPacing) */
+static volatile LONG  s_dp_gen;         /* bumped on a new window / display change */
+static volatile LONG  s_dp_started;
+static int            s_dp_observe;     /* timer paces, the thread only counts (RECOMP_PACING_STATS) */
+static volatile int   s_dp_running;     /* the thread counts display vblanks now */
+
+/* RECOMP_PACING_STATS=1: per presented frame the display vblanks since the one
+ * before (the renderer calls this after each present), a histogram every 10 s:
+ * "[pacing] refreshes per frame 1:a 2:b 3:c 4+:d". With the timer (=timer) the
+ * thread still counts, it only does not pace - the two modes side by side. */
+void xbox_GuestPresentNote(void)
+{
+    static int on = -1;
+    static uint64_t last_dv, t_last;
+    static unsigned h[5];
+    uint64_t dv, now, d;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PACING_STATS");
+        on = e && *e == '1';
+    }
+    if (!on || !s_dp_running)
+        return;
+    dv = s_dv_count;
+    now = host_now_ns();
+    if (last_dv) {
+        d = dv - last_dv;
+        h[d >= 4 ? 4 : d]++;
+    }
+    last_dv = dv;
+    if (!t_last)
+        t_last = now;
+    if (now - t_last >= 10000000000ull) {
+        fprintf(stderr, "[pacing] %s, refreshes per frame 0:%u 1:%u 2:%u 3:%u 4+:%u\n",
+                s_dv_hz ? "display paces" : "timer paces", h[0], h[1], h[2], h[3], h[4]);
+        memset(h, 0, sizeof h);
+        t_last = now;
+    }
+}
+
+/* Engage (hz > 0) or drop (0) the display as the clock source; counts re-based. */
+static void dp_set_source(int hz, int64_t period_ns, uint64_t last_ns)
+{
+    uint64_t now;
+    vb_period();                              /* the guest clock set up first */
+    clk_write_begin();
+    now = host_now_ns();
+    if (s_vb_period_ns > 0)
+        s_vb_base = vb_count_raw(now);
+    if (s_d60_t0)
+        s_d60_base = d60_count_raw(now);
+    s_dv_period_ns = period_ns;
+    s_dv_last_ns = last_ns;
+    s_dv_hz = hz;
+    s_d60_m = hz > 0 && hz % 60 == 0 ? hz / 60 : 0;
+    if (s_d60_m)
+        s_d60_r0 = s_dv_count;
+    else
+        s_d60_t0 = now;
+    if (s_vb_period_ns > 0)
+        vb_choose_source(now);
+    clk_write_end();
+}
+
+/* Measure the display: 120 vblank intervals, up to 3 tries. A whole rate of
+ * 120 Hz or more, a multiple of 60 within 1 %, and steady: at least 90 % of the
+ * intervals within 0.5 ms of the median (a variable-refresh display follows our
+ * own presents and would chase itself; a single wait woken late by the start-up
+ * load is no reason to give up - the first build demanded every interval within
+ * 1 ms and fell back to the timer on one 5 ms wake). Else 0. */
+static int cmp_i64(const void *a, const void *b)
+{
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int dp_measure(int64_t *period_ns, uint64_t *last_ns)
+{
+    enum { N = 120 };
+    uint64_t t[N + 1];
+    int64_t d[N], s[N], med, mean;
+    int i, hz, mult, ok, attempt;
+    for (attempt = 1; attempt <= 3; attempt++) {
+        for (i = 0; i <= N; i++) {
+            if (!host_vblank_wait())
+                return 0;
+            t[i] = host_now_ns();
+        }
+        for (i = 0; i < N; i++)
+            s[i] = d[i] = (int64_t)(t[i + 1] - t[i]);
+        qsort(s, N, sizeof s[0], cmp_i64);
+        med = s[N / 2];
+        mean = (int64_t)((t[N] - t[0]) / N);
+        for (ok = 0, i = 0; i < N; i++)
+            ok += d[i] - med < 500000 && med - d[i] < 500000;
+        hz = med > 0 ? (int)((1000000000ll + med / 2) / med) : 0;
+        mult = (hz + 30) / 60;
+        fprintf(stderr, "  frame pacing: display measured %.3f Hz (try %d: %d of %d intervals within 0.5 ms of the median)\n",
+                med > 0 ? 1e9 / (double)med : 0.0, attempt, ok, N);
+        if (hz < 110 || mult < 2 || mult > 4) {
+            fprintf(stderr, "  frame pacing: display below 120 Hz or above 240 Hz -> 60 Hz timer\n");
+            return 0;
+        }
+        if (fabs(1e9 / (double)med - 60.0 * mult) > 0.01 * 60.0 * mult) {
+            fprintf(stderr, "  frame pacing: %d Hz is no multiple of 60 -> 60 Hz timer\n", hz);
+            return 0;
+        }
+        if (ok * 10 >= N * 9) {
+            /* the mean over the window when it agrees, else the median (a late wake shifts one stamp) */
+            *period_ns = mean - med < 200000 && med - mean < 200000 ? mean : med;
+            *last_ns = t[N];
+            return 60 * mult;
+        }
+    }
+    fprintf(stderr, "  frame pacing: refresh not steady in 3 tries (variable refresh?) -> 60 Hz timer\n");
+    return 0;
+}
+
+static DWORD WINAPI dp_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        LONG gen = InterlockedCompareExchange(&s_dp_gen, 0, 0);
+        int64_t period = 0;
+        uint64_t last = 0;
+        int hz = 0, odd = 0;
+        if (host_vblank_open(s_dp_window))
+            hz = dp_measure(&period, &last);
+        else
+            fprintf(stderr, "  frame pacing: no display vblank on this host -> 60 Hz timer\n");
+        if (hz) {
+            s_dv_period_ns = period;
+            s_dv_last_ns = last;
+            if (s_dp_observe)
+                fprintf(stderr, "  frame pacing: 60 Hz timer paces, display %d Hz only counted (RECOMP_PACING_STATS)\n", hz);
+            else {
+                dp_set_source(hz, period, last);
+                fprintf(stderr, "  frame pacing: display %d Hz paces the guest vblank (guest %d Hz = every %d. refresh)\n",
+                        hz, s_vb_hz, s_vb_disp_n);
+            }
+            s_dp_running = 1;
+            while (gen == InterlockedCompareExchange(&s_dp_gen, 0, 0)) {
+                uint64_t now;
+                int64_t dt;
+                if (!host_vblank_wait()) {
+                    fprintf(stderr, "  frame pacing: display vblank wait failed -> 60 Hz timer\n");
+                    break;
+                }
+                now = host_now_ns();
+                dt = (int64_t)(now - s_dv_last_ns);
+                /* a wait woken late (thread not scheduled): the refreshes it
+                 * missed still count, else game time would fall behind */
+                if (dt > period + period / 2)
+                    s_dv_count += (uint64_t)((dt + period / 2) / period) - 1;
+                /* count first, time second: a reader in between computes the
+                 * next vblank as already due (a 0.25 ms wait), never a
+                 * refresh too late */
+                s_dv_count++;
+                s_dv_last_ns = now;
+                /* refreshes that keep missing the period: the display is not
+                 * steady any more (VRR came on, mode change) */
+                {
+                    int64_t r = dt % period;
+                    if (r > period / 2) r = period - r;
+                    odd = r > 1000000 ? odd + 1 : 0;
+                }
+                if (odd > 30) {
+                    fprintf(stderr, "  frame pacing: refresh no longer steady -> 60 Hz timer\n");
+                    break;
+                }
+                if (dt > period / 2 && dt < period + period / 2)
+                    s_dv_period_ns = period = period + (dt - period) / 64;
+            }
+            s_dp_running = 0;
+            if (!s_dp_observe)
+                dp_set_source(0, 0, 0);
+        }
+        host_vblank_close();
+        /* wait for a new window / display before trying again (2 s poll) */
+        while (gen == InterlockedCompareExchange(&s_dp_gen, 0, 0))
+            host_sleep_ns(2000000000ull);
+    }
+    return 0;
+}
+
+/* The renderer's window, at its creation and on every display change: (re)bind
+ * the display pacing to the display it is on. RECOMP_FRAME_PACING=timer: off. */
+void xbox_GuestDisplayPacing(void *native_window)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_FRAME_PACING");
+        const char *st = getenv("RECOMP_PACING_STATS");
+        off = e && !strcmp(e, "timer");
+        if (off)
+            fprintf(stderr, "  frame pacing: 60 Hz timer (RECOMP_FRAME_PACING=timer)\n");
+        if (off && st && *st == '1')
+            off = 0, s_dp_observe = 1;            /* count only, for the statistics */
+    }
+    if (off || !native_window)
+        return;
+    s_dp_window = native_window;
+    InterlockedIncrement(&s_dp_gen);
+    if (!InterlockedExchange(&s_dp_started, 1))
+        CloseHandle(CreateThread(NULL, 0, dp_thread, NULL, 0, NULL));
 }
 
 /* The guest vblank rate in Hz now, 0 = off. */
@@ -942,17 +1263,14 @@ void xbox_GuestFlipWait(void)
     InterlockedIncrement(&s_waits_flip);
     wait_stats();
     int64_t p = vb_period();
-    uint64_t now, next;
     counter_mirrors_tick();
     if (!p) {
         sleep_ns(100000);
         return;
     }
-    now = host_now_ns() - s_vb_t0_ns;
-    next = (now / (uint64_t)p + 1) * (uint64_t)p;
     {
         long long t0 = xbox_ft_on() ? xbox_ft_now() : 0;
-        sleep_ns(next - now);
+        sleep_ns((uint64_t)xbox_GuestNsToNextVblank());   /* timer or display (FRAME PACING) */
         if (t0)                                    /* the renderer's lines: game time spent waiting */
             xbox_ft_vblank_wait(xbox_ft_ms(t0));   /* as slept, oversleeping included */
     }

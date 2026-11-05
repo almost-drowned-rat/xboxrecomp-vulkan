@@ -7,6 +7,8 @@ project(platform C)
 #
 #   host_wait.*    - host clock + waits for every title (high-resolution
 #                    timer, precise deadline wait), both hosts
+#   host_vblank.*  - wait for the display's vblank (FRAME PACING Display;
+#                    Windows gdi32 D3DKMT, other hosts: not available yet)
 #   host_info.*    - the log's "version:" and "host:" lines (release name,
 #                    game + toolkit commits, Windows / Wine / Steam Deck)
 #
@@ -26,10 +28,10 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 if(WIN32)
-    add_library(platform STATIC host_wait.c host_info.c)
+    add_library(platform STATIC host_wait.c host_info.c host_vblank.c)
     target_include_directories(platform PUBLIC ${XBOXRECOMP_SRC_DIR})
 else()
-    add_library(platform STATIC win32_compat.c host_wait.c host_info.c)
+    add_library(platform STATIC win32_compat.c host_wait.c host_info.c host_vblank.c)
     target_include_directories(platform PUBLIC
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}

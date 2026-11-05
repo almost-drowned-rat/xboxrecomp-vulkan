@@ -296,7 +296,8 @@ D3D's busy-waits that call those handlers – the guest lock burnout3-sw has (`x
         default BORDERLESS, applies at once), RENDER RESOLUTION, ASPECT RATIO (4:3 / 16:9), MENUS AT 16:9
         (PILLARBOXED / STRETCHED, shown only with 16:9; movies always stay 4:3), ANISOTROPIC FILTER,
         **ANTIALIASING ▸** (a sub-menu with every choice: OFF / FXAA / SMAA / MSAA 2X / MSAA 4X, default FXAA;
-        applies at once), **FRAME RATE ▸** (FRAME RATE, VSYNC, FPS COUNTER: OFF / FPS / FPS AND FRAME TIME / FRAME
+        applies at once), **FRAME RATE ▸** (FRAME RATE, FRAME PACING: DISPLAY / 60 HZ TIMER - see "Frame pacing"
+        below, VSYNC, FPS COUNTER: OFF / FPS / FPS AND FRAME TIME / FRAME
         TIME), **SHADERS ▸** (the optional slang shaders, if the port has the module), **BOOT ANIMATION ▸ as the
         last line** (SHADERS before it - maintainer, 2026-10-27; a status line - BOOT.MPG FOUND / "NEEDS BOOT MPG IN
         THE MEDIA FOLDER" / "CONVERT BOOT VIDEO TO BOOT.MPG  SEE README" when only a boot.mp4 / mkv is there - then
@@ -409,6 +410,20 @@ D3D's busy-waits that call those handlers – the guest lock burnout3-sw has (`x
         does everything that needs it in one go: the real display gate (the setting, no test switch), the cost series
         original vs 120 and the maintainer's frame-pacing / adaptive-sync check. Then it says so, and the display is
         disconnected again. Nothing is replugged during that session.
+        **Frame pacing (maintainer, 2026-11-05: a fixed part of the port guidelines, every recomp integrates it):**
+        on a display whose rate is a whole multiple of the guest's vblank rate (120 / 180 / 240 Hz for a 60 Hz
+        title) the guest vblank follows the **display's own vblank** - every game frame stays exactly 2 / 3 / 4
+        refreshes - instead of a free-running 60 Hz software timer, which drifts against the refresh (frames shown
+        for 1 and 3 refreshes in turn = judder). Toolkit: `platform/host_vblank.{h,c}` (Windows gdi32
+        `D3DKMTWaitForVerticalBlankEvent`, no DXGI; other hosts fall back to the timer until `VK_KHR_present_wait`
+        is wired), the pacing thread in `kernel/xbox_memory_layout.c` (measures 60 intervals; engages only on a
+        steady 120 / 180 / 240 Hz display, multiple of 60 within 1 %, every interval within 1 ms - variable refresh
+        and 60 / 144 / 165 Hz stay on the timer; the 60 Hz game-time count follows the display too, so game time
+        and frames never drift; counts re-based on every change, monotonic), `xbox_GuestDisplayPacing(hwnd)` from
+        the renderer at window creation and display / mode changes. The port's line: **FRAME PACING: DISPLAY
+        (default) / 60 HZ TIMER** in FRAME RATE, after a restart (`RECOMP_FRAME_PACING=timer`). Check with
+        `RECOMP_PACING_STATS=1` (refreshes per presented frame, every 10 s) on a 120 Hz display, timer vs display.
+        Reference: THPS 2X Recompiled (this toolkit), NinjaGaiden2-Recompiled (same idea on rexglue).
         **PAL60 rule** (maintainer, 2026-10-24; every port): a PAL title that supports PAL60 never runs at 50 Hz in
         the recomp – no 50 Hz option, no 50 Hz override, its PAL variant always answers PAL60 (a 30-fps title:
         30 instead of 25 fps). A PAL title without PAL60 keeps 50 Hz; improved later only by interpolation over
@@ -467,6 +482,10 @@ Things that cost THPS 2X days and should be done up front:
    range ([lessons_learned.md](lessons_learned.md)).
 6. **Log hygiene:** repeated messages rate-limited per key from the start; a 1 GB log hides the one line that
    matters.
+6b. **Gameplay patches (THPS 2X M6, [lessons_learned.md](lessons_learned.md) "M6 / v1.0"):** instrument a decision
+   by overriding its callee keyed on the return address (no relift); ship env trace flags that say what decided;
+   decide feel-based limits from a live-logged play test with the maintainer; read every consumer of a field before
+   assuming its units.
 7. **Low-end from day 1 (A11):** Vulkan 1.3 baseline (weak 1.3 hardware is the low end), ETC2/ASTC texture path, cache caps, "low" profile,
    shader pre-warm, reached-code-only builds, game thread + render thread (Design principles).
 8. **From XboxXBE-Recomp (A12; TGP482, MIT – keep the attribution in every borrowed file):**

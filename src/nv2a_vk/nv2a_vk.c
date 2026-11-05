@@ -199,6 +199,17 @@ static void display_hz_update(void)
         s_display_hz = hz;
         LOGE("display refresh: %.2f Hz\n", hz);
     }
+#if defined(_WIN32)
+    {
+        /* FRAME PACING Display: the kernel's clock binds to the display the
+         * window is on (at creation, on a display or mode change) */
+        extern void xbox_GuestDisplayPacing(void *native_window);
+        void *hwnd = s_win ? SDL_GetPointerProperty(SDL_GetWindowProperties(s_win),
+                                                    SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL) : NULL;
+        if (hwnd)
+            xbox_GuestDisplayPacing(hwnd);
+    }
+#endif
 }
 #endif
 
@@ -7051,6 +7062,10 @@ static void vk_flip(void)
         xbox_ft_push(FT_PRESENT);
         pr = vkQueuePresentKHR(s_queue, &pi);
         xbox_ft_pop();
+        {
+            extern void xbox_GuestPresentNote(void);   /* RECOMP_PACING_STATS (FRAME PACING) */
+            xbox_GuestPresentNote();
+        }
         if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
             vkDeviceWaitIdle(s_dev);
             create_swapchain();
