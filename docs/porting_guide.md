@@ -268,7 +268,9 @@ D3D's busy-waits that call those handlers – the guest lock burnout3-sw has (`x
       every written file is flushed to the disk (`FlushFileBuffers` / `fsync`) before it is read back. Reader: `xdvdfs.c` from takedawn-xboxrecomp (MIT, sp00nz). Test: `tests/game_setup`
       (synthetic image, fault injection).
 - [ ] **Aspect-ratio rule (maintainer, 2026-10-16, every port):**
-      - **Only 4:3 and 16:9** (maintainer, 2026-10-18; every port, no 21:9 or others). 16:9 applies **only to gameplay**.
+      - **4:3, 16:9, 16:10 and 21:9** (THPS 2X, 2026-11-07; was "only 4:3 and 16:9", 2026-10-18):
+        `RECOMP_WIDESCREEN` = 1 / 16:9, 16:10, 21:9 (64:27), `xbox_video_aspect()`. The wide aspects apply **only to
+        gameplay**. Mouse cursor: hidden over the game window, shown while it moves (nv2a_vk, RECOMP_CURSOR_IDLE_MS).
       - A game without native 16:9 support keeps menus, loading screens and movies at **4:3, pillarboxed** (never stretched); only gameplay is rendered in the chosen aspect ratio (wider projection/FOV, not stretching).
       - The in-game HUD during gameplay always follows the chosen aspect ratio (maintainer, 2026-10-18; every port):
   anchored to the screen edges of the wider view, never stretched.

@@ -202,14 +202,30 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
 void (*g_xbox_screenshot_hook)(const char *name) = NULL;
 void (*volatile g_xbox_nv2a_idle_hook)(void) = NULL;
 
+/* The gameplay aspect ratio (THPS 2X maintainer, 2026-11-07: 16:10 and 21:9
+ * next to 4:3 / 16:9; every port): RECOMP_WIDESCREEN unset / 0 = 4:3, 1 or
+ * 16:9, 16:10, 21:9 (= 64:27, the 2560x1080 / 5120x2160 panels; 3440x1440 is
+ * 43:18, under 1 % narrower). */
+double xbox_video_aspect(void)
+{
+    static double a = 0.0;
+    if (a == 0.0) {
+        const char *e = getenv("RECOMP_WIDESCREEN");
+        if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "4:3"))
+            a = 4.0 / 3.0;
+        else if (!strcmp(e, "16:10"))
+            a = 16.0 / 10.0;
+        else if (!strcmp(e, "21:9"))
+            a = 64.0 / 27.0;
+        else
+            a = 16.0 / 9.0;                       /* "1", "16:9" */
+    }
+    return a;
+}
+
 int xbox_video_widescreen(void)
 {
-    static int ws = -1;
-    if (ws < 0) {
-        const char *e = getenv("RECOMP_WIDESCREEN");
-        ws = e && e[0] == '1';
-    }
-    return ws;
+    return xbox_video_aspect() > 4.0 / 3.0 + 0.01;
 }
 
 /* A title without native 16:9 (aspect-ratio rule, porting_guide.md): only

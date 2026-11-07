@@ -70,6 +70,13 @@ void nv2a_vk_set_fps_hud(int mode);
  * thread; the next flip. RECOMP_STRETCH_43=1|0 overrides it. */
 void nv2a_vk_set_stretch_43(int on);
 
+/* HUD un-stretch (2026-11-07): draws with the transform program whose FNV
+ * hash is program_hash (RECOMP_VK_DRAW_LOG prints it) and a box of at most
+ * 60 % of the 640 logical width are pressed back to their 4:3 width by k
+ * (aspect / (4/3)) around the left edge, the centre or the right edge. Any
+ * thread; per frame. k <= 1 or hash 0: off. */
+void nv2a_vk_set_hud_squash(uint32_t program_hash, double k);
+
 /* ANTIALIASING (porting_guide.md M6): OFF, FXAA (the present pass, the default
  * -- the picture as before the option), SMAA (iryoku/smaa, three passes at the
  * presented surface's size before it is scaled into the window), MSAA 2X / 4X

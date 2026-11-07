@@ -59,7 +59,8 @@ Borrowed code: origin (repo, commit, file) in the header comment and in `docs/so
 ## Features
 
 - **Aspect ratios other than 4:3 (maintainer rule, every port; toolkit `docs/porting_guide.md`, M5):**
-  - **Only 4:3 and 16:9** (maintainer, 2026-10-18; every port, no 21:9 or others). 16:9 applies **only to gameplay**.
+  - **4:3, 16:9, 16:10 and 21:9** (maintainer, 2026-11-07; was only 4:3 and 16:9). The wide aspects apply **only to
+    gameplay** (`RECOMP_WIDESCREEN` 1 / 16:9, 16:10, 21:9 = 64:27; `xbox_video_aspect()`).
   - A game without native 16:9 support keeps menus, loading screens and movies at **4:3, pillarboxed** (never stretched); only gameplay is rendered in the chosen aspect ratio (wider projection/FOV, not stretching).
   - The in-game HUD during gameplay always follows the chosen aspect ratio (maintainer, 2026-10-18; every port):
   anchored to the screen edges of the wider view, never stretched.

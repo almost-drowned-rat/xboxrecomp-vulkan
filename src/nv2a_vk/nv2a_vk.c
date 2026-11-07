@@ -706,6 +706,13 @@ static int      s_square, s_square_env;
 static volatile int s_opt_scale_q, s_opt_wide;
 static int      s_scale_env;
 
+/* How many more columns a wide frame has than a 4:3 one: the gameplay
+ * aspect (xbox_video_aspect: 16:9, 16:10, 21:9) over 4:3 -- 4/3 at 16:9. */
+static double wide_xr(void)
+{
+    return xbox_video_aspect() * 0.75;
+}
+
 /* The port's "menus stretched" option (nv2a_vk_set_stretch_43): with 16:9
  * on, the frames the port marks 4:3 (menus, movies) fill the 16:9 window
  * instead of being pillarboxed, as the Xbox dashboard's widescreen setting
@@ -763,7 +770,7 @@ volatile int nv2a_vk_scale_pct;
  * by the device's image limits. */
 static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
 {
-    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    double kx = s_scale_x * (s_square && aa_sx <= 1 ? wide_xr() : 1.0), ky = s_scale;
     if (w * kx > (double)s_max_size || h * ky > (double)s_max_size) {
         static int told;
         if (!told++)
@@ -876,7 +883,7 @@ static void update_fit_mask(void)
         uint32_t m = 0;
         for (i = 0; i <= VK_SCALE_STEPS; i++) {
             double f = 1.0 + 0.25 * i;
-            if (scale_fits(f * (a ? 4.0 / 3.0 : 1.0), f))
+            if (scale_fits(f * (a ? wide_xr() : 1.0), f))
                 m |= 1u << i;
         }
         s_fit_mask[a] = m & ~s_fit_bad[a];
@@ -3427,7 +3434,7 @@ static int create_swapchain(void)
     }
     s_sc_extent = caps.currentExtent;
     if (s_sc_extent.width == 0xFFFFFFFFu) {
-        s_sc_extent.width = xbox_video_widescreen() ? 1280 : 960;   /* the window's aspect (SDL_CreateWindow) */
+        s_sc_extent.width = (uint32_t)(720.0 * xbox_video_aspect() + 0.5);   /* the window's aspect (SDL_CreateWindow) */
         s_sc_extent.height = 720;
     }
     ci.surface = s_surface;
@@ -3748,7 +3755,7 @@ static int ready(void)
                  * when resized, so no bars are added around the picture. A
                  * rectangle the port saved (nv2a_vk_set_window_rect) keeps
                  * its height and position, the width follows the aspect. */
-                float aspect = xbox_video_widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
+                float aspect = (float)xbox_video_aspect();   /* 4:3, 16:9, 16:10, 21:9 (2026-11-07) */
                 int wh = s_wr_have ? s_wr_want[3] : 720;
                 int ww = (int)(wh * aspect + 0.5f);
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", ww, wh,
@@ -3867,7 +3874,7 @@ static int ready(void)
             s_square_env = 0, s_scale_env = 1;
         s_square = s_square_env && nv2a_vk_square;
         if (k > 0.0)
-            s_xratio = (k < 0.5 ? 0.5 : k > VK_SCALE_MAX * 4.0 / 3.0 ? VK_SCALE_MAX * 4.0 / 3.0 : k) / s_scale;
+            s_xratio = (k < 0.5 ? 0.5 : k > VK_SCALE_MAX * 64.0 / 27.0 * 0.75 ? VK_SCALE_MAX * 64.0 / 27.0 * 0.75 : k) / s_scale;
         s_xratio_env = s_xratio;
         s_scale_x = s_scale * s_xratio;
         if (s_scale != 1.0 || s_scale_x != 1.0 || s_square)
@@ -4785,6 +4792,83 @@ static void vm_prepare(const Nv2aRawBatch *b)
     }
 }
 
+/* HUD un-stretch (THPS 2X maintainer, 2026-11-07: SCORE / SPECIAL to the
+ * edges at 16:9 / 16:10 / 21:9). A title that draws its 2D in the 640-wide
+ * logical space shows it stretched by the wide square-pixel surface. The port
+ * names its screen-space program (FNV hash of the transform program, as
+ * RECOMP_VK_DRAW_LOG prints it) and the stretch k (aspect / (4/3)); every draw
+ * with that program whose box is at most 60 % of the width is pressed back to
+ * its 4:3 width around an anchor by the box's centre: the left edge (left
+ * third), the right edge (right third), else the centre - x' = A + (x - A) / k.
+ * Only the ring copy of the vertices is changed, never the title's memory.
+ * nv2a_vk_set_hud_squash(0, 0) or k <= 1: off. */
+static volatile uint32_t s_sq_prog;
+static volatile float    s_sq_k;
+static int   s_sq_on;                   /* this draw: squash attribute 0's x */
+static float s_sq_a, s_sq_kd;           /* this draw's anchor and k */
+
+void nv2a_vk_set_hud_squash(uint32_t program_hash, double k)
+{
+    s_sq_prog = program_hash;
+    s_sq_k = k > 1.001 ? (float)k : 0.0f;
+}
+
+static uint32_t vp_hash(const Nv2aRawBatch *b)
+{
+    uint32_t h = 2166136261u, sl;
+    int w;
+    if (b->xform != 2 || !b->vp_program)
+        return 0;
+    for (sl = b->vp_start; sl < b->vp_slots && sl < 136; sl++) {
+        for (w = 0; w < 4; w++)
+            h = (h ^ b->vp_program[sl][w]) * 16777619u;
+        if (b->vp_program[sl][3] & 1u)
+            break;
+    }
+    return h;
+}
+
+/* attribute 0's position x of vertex v (float data only); 0 if not readable */
+static int pos_x(const Nv2aRawBatch *b, uint32_t v, float *x)
+{
+    if (b->attr_direct & 1u) {
+        if (b->direct[0].type != 2 || b->direct[0].size < 2)
+            return 0;
+        memcpy(x, b->direct[0].ptr + (size_t)v * b->direct[0].stride, 4);
+        return 1;
+    }
+    if (!(b->attr_present & 1u))
+        return 0;
+    *x = b->attrs[((size_t)v * NV2A_RAW_ATTRS) * 4];
+    return 1;
+}
+
+/* 1 when this draw is squashed (anchor / k in s_sq_a / s_sq_kd); s_sq_on is
+ * set by the caller only around this draw's own upload */
+static int squash_decide(const Nv2aRawBatch *b)
+{
+    float k = s_sq_k, x0 = 1e30f, x1 = -1e30f, x;
+    uint32_t v;
+    if (!(k > 1.0f) || !s_sq_prog || !b->vertex_count || vp_hash(b) != s_sq_prog)
+        return 0;
+    for (v = 0; v < b->vertex_count; v++) {
+        if (!pos_x(b, v, &x))
+            return 0;
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+    }
+    if (x0 < -1.0f || x1 > 641.0f || x1 - x0 > 384.0f)
+        return 0;                        /* full-screen passes and the like stay */
+    {
+        /* by the box's centre: the left third -> the left edge (the SPECIAL
+         * bar, 39..199, reaches past 30 %), the right third -> the right edge */
+        float c = 0.5f * (x0 + x1);
+        s_sq_a = c < 640.0f / 3.0f ? 0.0f : c > 1280.0f / 3.0f ? 640.0f : 320.0f;
+    }
+    s_sq_kd = k;
+    return 1;
+}
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -4818,6 +4902,8 @@ static int upload_vertices(const Nv2aRawBatch *b)
     for (i = 0; i < nrun; i++) {
         uintptr_t gva = (uintptr_t)run[i].lo - (uintptr_t)xbox_GetMemoryOffset();
         run[i].buf = VK_NULL_HANDLE;
+        if (s_sq_on && (direct & 1u) && of_run[0] == (int)i)
+            gva = 0;                        /* HUD squash: a ring copy to change */
         if (gva >= VM_BASE && gva < VM_BASE + VM_WINDOW
             && vm_bind((uint32_t)gva, (uint32_t)(run[i].hi - run[i].lo), &run[i].buf, &run[i].boff, 0)) {
             s_vm_st_hit++;
@@ -4841,6 +4927,17 @@ static int upload_vertices(const Nv2aRawBatch *b)
     for (i = 0; i < nrun; i++)
         if (!run[i].buf)
             memcpy(dst + run[i].at, run[i].lo, (size_t)(run[i].hi - run[i].lo));
+    if (s_sq_on && (direct & 1u) && b->direct[0].type == 2) {
+        const VRun *r = &run[of_run[0]];
+        uint8_t *p0 = dst + r->at + (size_t)(b->direct[0].ptr - r->lo);
+        for (v = 0; v < nv; v++) {
+            float x;
+            uint8_t *q = p0 + (size_t)v * b->direct[0].stride;
+            memcpy(&x, q, 4);
+            x = s_sq_a + (x - s_sq_a) / s_sq_kd;
+            memcpy(q, &x, 4);
+        }
+    }
     if (np) {
         float *out = (float *)(dst + pack_at);
         for (v = 0; v < nv; v++)
@@ -4850,6 +4947,8 @@ static int upload_vertices(const Nv2aRawBatch *b)
                     attr_to_float4(b, slot[i], v, o);
                 else
                     memcpy(o, b->attrs + ((size_t)v * NV2A_RAW_ATTRS + slot[i]) * 4, 16);
+                if (s_sq_on && slot[i] == 0)       /* HUD squash, converted position */
+                    o[0] = s_sq_a + (o[0] - s_sq_a) / s_sq_kd;
             }
     }
     memcpy(dst + const_at, b->attr_const, NV2A_RAW_ATTRS * 16);
@@ -5039,6 +5138,7 @@ static void pend_flush(void)
     if (!s_pend.on)
         return;
     s_pend.on = 0;
+    s_sq_on = 0;                                /* a pending batch is never a squashed one */
     if (s_pend.cb_gen != s_cb_gen)
         return;                                 /* cannot happen: flushes go first */
     vkCmdDrawIndexed(s_cb, s_pend.n, s_pend.count, 0, 0, 0);
@@ -5183,11 +5283,75 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     }
     s_st_draws++;
     {
-        int changed = regs_changed(r);
-        if (pend_append(b, changed))
-            return;
+        /* RECOMP_VK_DRAW_LOG=<N> (diagnostic, THPS 2X HUD analysis
+         * 2026-11-07): every draw of every N-th frame - transform kind (0
+         * pre-transformed, 1 fixed-function, 2 program), primitive, vertex
+         * count, texture 0, and the box of attribute 0 (raw: real pixels for
+         * kind 0, object space otherwise; kind 1 also through the composite
+         * and the viewport offset, logical pixels). */
+        static long dl_frame = -2;
+        if (dl_frame == -2) {
+            const char *e = getenv("RECOMP_VK_DRAW_LOG");
+            dl_frame = e && *e ? atol(e) : -1;
+        }
+        if (dl_frame > 0 && s_frame % (uint32_t)dl_frame < 2 && b->vertex_count) {   /* two frames every N */
+            float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f, sx0 = 1e30f, sx1 = -1e30f;
+            uint32_t v, nv = b->vertex_count;
+            for (v = 0; v < nv; v++) {
+                float px, py, pz = 0.0f, pw = 1.0f;
+                if (b->attr_direct & 1u) {
+                    const uint8_t *q = b->direct[0].ptr + (size_t)v * b->direct[0].stride;
+                    if (b->direct[0].type != 2)
+                        break;
+                    memcpy(&px, q, 4); memcpy(&py, q + 4, 4);
+                    if (b->direct[0].size > 2) memcpy(&pz, q + 8, 4);
+                    if (b->direct[0].size > 3) memcpy(&pw, q + 12, 4);
+                } else {
+                    const float *a = b->attrs + ((size_t)v * 16) * 4;
+                    px = a[0]; py = a[1]; pz = a[2]; pw = a[3];
+                }
+                if (px < x0) x0 = px; if (px > x1) x1 = px;
+                if (py < y0) y0 = py; if (py > y1) y1 = py;
+                if (b->xform == 1) {
+                    const float *m = b->composite;
+                    float cx = m[0] * px + m[1] * py + m[2] * pz + m[3] * pw;
+                    float cw = m[12] * px + m[13] * py + m[14] * pz + m[15] * pw;
+                    if (cw != 0.0f) {
+                        float sx = cx / cw + b->vp_offset[0];
+                        if (sx < sx0) sx0 = sx; if (sx > sx1) sx1 = sx;
+                    }
+                }
+            }
+            {
+                /* the transform program: start slot, and an FNV hash of the
+                 * slots from it to the end marker (bit 0 of word 3), max 136 */
+                uint32_t hsh = 2166136261u, sl, nsl = 0;
+                if (b->xform == 2 && b->vp_program)
+                    for (sl = b->vp_start; sl < b->vp_slots && sl < 136; sl++) {
+                        int w;
+                        for (w = 0; w < 4; w++)
+                            hsh = (hsh ^ b->vp_program[sl][w]) * 16777619u;
+                        nsl++;
+                        if (b->vp_program[sl][3] & 1u)
+                            break;
+                    }
+                fprintf(stderr, "[DRAW] f %u xf %u vp %u/%u/%08X prim %u n %u tex %08X x %.1f..%.1f y %.1f..%.1f%s",
+                        s_frame, b->xform, b->vp_start, nsl, hsh, b->prim, nv, b->tex_va[0], x0, x1, y0, y1,
+                        b->xform == 1 ? "" : "\n");
+            }
+            if (b->xform == 1)
+                fprintf(stderr, " sx %.1f..%.1f\n", sx0, sx1);
+        }
     }
-    pend_flush();
+    {
+        int changed = regs_changed(r);
+        int sq = s_sq_k > 0.0f ? squash_decide(b) : 0;
+        s_sq_on = 0;
+        if (!sq && pend_append(b, changed))
+            return;
+        pend_flush();                            /* the pending batch: never squashed */
+        s_sq_on = sq;                            /* this draw's upload only */
+    }
     if (!prim_indices(b, &idx, &n, &topo, &cls) || !n)
         return;
     VT("draw: prim %u idx %u verts %u attrs %04X direct %04X xform %u surf %08X zeta %08X\n", b->prim, n,
@@ -5391,8 +5555,12 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
             ub[1].range = sizeof(FsBlock);
         }
     }
-    if (!upload_vertices(b))
-        return;
+    {
+        int ok = upload_vertices(b);
+        s_sq_on = 0;                               /* the HUD squash was for this upload only */
+        if (!ok)
+            return;
+    }
     {
         VkDeviceSize iat;
         if (b->vertex_count <= 65536) {
@@ -6828,7 +6996,7 @@ static void vk_flip(void)
             if (k < 0.5) k = 0.5;
             if (k > VK_SCALE_MAX) k = VK_SCALE_MAX;
             /* 16:9: 4/3 more columns, except on frames marked 4:3 (menus). */
-            xr = s_opt_wide && xbox_present_wide_mark() != 0 ? 4.0 / 3.0 : 1.0;
+            xr = s_opt_wide && xbox_present_wide_mark() != 0 ? wide_xr() : 1.0;
             sq = 0;                     /* the option's X already holds the 4/3 */
         } else {
             k = pct < 50 ? 0.0 : pct > 500 ? VK_SCALE_MAX : pct / 100.0;
@@ -6956,7 +7124,7 @@ static void vk_flip(void)
                  * pillarboxed. */
                 if (!s_boot_on                     /* the boot video keeps its own aspect */
                     && (xbox_present_wide() || (xbox_video_widescreen() && stretch_43())) && lw < lh * 1.5f)
-                    lw = lh * 16.0f / 9.0f;
+                    lw = lh * (float)xbox_video_aspect();
                 scale = ww / lw < wh / lh ? ww / lw : wh / lh;
                 dw = (int)(lw * scale); dh = (int)(lh * scale);
                 dx = ((int)ww - dw) / 2; dy = ((int)wh - dh) / 2;
@@ -7149,8 +7317,31 @@ static void vk_flip(void)
 #if !defined(__SWITCH__)
     if (s_win) {
         SDL_Event e;
+        /* Mouse cursor auto-hide (THPS 2X maintainer, 2026-11-06; every
+         * port): hidden over the game window, shown while the mouse moves,
+         * hidden again after RECOMP_CURSOR_IDLE_MS (default 2000; 0 = never
+         * hide). SDL hides it only inside its own window. */
+        static int cur_init, cur_shown;
+        static uint64_t cur_idle_ns, cur_moved;
+        uint64_t now_c = hz_now();
+        if (!cur_init) {
+            const char *ev = getenv("RECOMP_CURSOR_IDLE_MS");
+            cur_init = 1;
+            cur_idle_ns = (uint64_t)(ev && *ev ? strtoul(ev, NULL, 10) : 2000ul) * 1000000ull;
+            cur_shown = 1;                         /* hidden below once idle */
+            cur_moved = now_c - cur_idle_ns;
+        }
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
+            case SDL_EVENT_MOUSE_MOTION:
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+            case SDL_EVENT_MOUSE_WHEEL:
+                cur_moved = now_c;
+                if (!cur_shown) {
+                    SDL_ShowCursor();
+                    cur_shown = 1;
+                }
+                break;
             case SDL_EVENT_KEY_DOWN:
             case SDL_EVENT_KEY_UP:
                 /* Edges only: auto-repeat would read as a held key anyway. */
@@ -7178,6 +7369,10 @@ static void vk_flip(void)
             default:
                 break;
             }
+        }
+        if (cur_shown && cur_idle_ns && now_c - cur_moved >= cur_idle_ns) {
+            SDL_HideCursor();
+            cur_shown = 0;
         }
         dm_apply();                                /* a DISPLAY MODE change from the port */
     }

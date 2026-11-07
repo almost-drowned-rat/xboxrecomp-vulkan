@@ -33,6 +33,9 @@
 /* Nonzero when the title was told the TV is 16:9 (kernel_xbox.c): present
  * the logical surface at 16:9 instead of 4:3. */
 int xbox_video_widescreen(void);
+/* The gameplay aspect ratio (RECOMP_WIDESCREEN: 4:3, 16:9 = 1, 16:10, 21:9 =
+ * 64:27); widescreen = anything wider than 4:3. */
+double xbox_video_aspect(void);
 /* Whether this frame is shown at 16:9: widescreen on and the port has not
  * marked the frame as 4:3 (menus of a title without native 16:9). */
 int xbox_present_wide(void);
