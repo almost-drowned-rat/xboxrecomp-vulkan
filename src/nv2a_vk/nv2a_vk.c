@@ -4799,7 +4799,7 @@ static void vm_prepare(const Nv2aRawBatch *b)
  * RECOMP_VK_DRAW_LOG prints it) and the stretch k (aspect / (4/3)); every draw
  * with that program whose box is at most 60 % of the width is pressed back to
  * its 4:3 width around an anchor by the box's centre: the left edge (left
- * third), the right edge (right third), else the centre - x' = A + (x - A) / k.
+ * quarter), the right edge (right quarter), else the centre - x' = A + (x - A) / k.
  * Only the ring copy of the vertices is changed, never the title's memory.
  * nv2a_vk_set_hud_squash(0, 0) or k <= 1: off. */
 static volatile uint32_t s_sq_prog;
@@ -4860,10 +4860,13 @@ static int squash_decide(const Nv2aRawBatch *b)
     if (x0 < -1.0f || x1 > 641.0f || x1 - x0 > 384.0f)
         return 0;                        /* full-screen passes and the like stay */
     {
-        /* by the box's centre: the left third -> the left edge (the SPECIAL
-         * bar, 39..199, reaches past 30 %), the right third -> the right edge */
+        /* by the box's centre: the left quarter -> the left edge (the SPECIAL
+         * bar, 39..199, centre 119), the right quarter -> the right edge, else
+         * the centre. Quarters, not thirds (THPS 2X GitHub #10, v1.2.1): the
+         * grind balance meter's left end tick sits at x ~212, just inside the
+         * left third, and was torn off the rest of the meter (centre). */
         float c = 0.5f * (x0 + x1);
-        s_sq_a = c < 640.0f / 3.0f ? 0.0f : c > 1280.0f / 3.0f ? 640.0f : 320.0f;
+        s_sq_a = c < 640.0f / 4.0f ? 0.0f : c > 640.0f * 3.0f / 4.0f ? 640.0f : 320.0f;
     }
     s_sq_kd = k;
     return 1;
