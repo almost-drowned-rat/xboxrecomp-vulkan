@@ -26,7 +26,7 @@ cmake --build "$OUT/runtime" -j "$JOBS"
 # project that pulls the runtime in with add_subdirectory(../..). The other
 # tests under tests/ still use Win32 file APIs directly (GetTempPathA,
 # CreateDirectoryA, _wfopen ...) and are Windows-only until ported.
-TESTS="${TESTS:-kernel_bridge kernel_memory_posix memory_layout_posix memory_regressions nv2a_combiner nv2a_vsh adpcm_decode fp_precision mmx_integer mmx_rounding fist}"
+TESTS="${TESTS:-kernel_bridge kernel_memory_posix memory_layout_posix memory_regressions nv2a_combiner nv2a_vsh adpcm_decode fp_precision mmx_integer mmx_rounding fist video_aspect}"
 # Known Linux failures, excluded by name so a new one shows. None at the moment
 # (2026-10-15: the memory_regressions ext-vma hang and the memory_layout_posix
 # crash were fixed -- reserved 4 GB guest window, VirtualQuery sizes, joined

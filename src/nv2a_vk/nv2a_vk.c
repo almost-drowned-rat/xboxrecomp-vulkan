@@ -3755,8 +3755,22 @@ static int ready(void)
                  * when resized, so no bars are added around the picture. A
                  * rectangle the port saved (nv2a_vk_set_window_rect) keeps
                  * its height and position, the width follows the aspect. */
-                float aspect = (float)xbox_video_aspect();   /* 4:3, 16:9, 16:10, 21:9 (2026-11-07) */
+                float aspect;
                 int wh = s_wr_have ? s_wr_want[3] : 720;
+                {
+                    /* 21:9 = the display's exact ratio (THPS 2X maintainer,
+                     * 2026-11-08; xbox_video_aspect_fit): the display the
+                     * saved window sits on, else the primary one */
+                    SDL_Point pt = { s_wr_want[0] + 16, s_wr_want[1] + 16 };
+                    SDL_DisplayID did = s_wr_have ? SDL_GetDisplayForPoint(&pt) : 0;
+                    const SDL_DisplayMode *dm;
+                    if (!did)
+                        did = SDL_GetPrimaryDisplay();
+                    dm = did ? SDL_GetDesktopDisplayMode(did) : NULL;
+                    if (dm && dm->w > 0 && dm->h > 0)
+                        xbox_video_aspect_fit((double)dm->w / (double)dm->h);
+                }
+                aspect = (float)xbox_video_aspect();   /* 4:3, 16:9, 16:10, 21:9 (2026-11-07) */
                 int ww = (int)(wh * aspect + 0.5f);
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", ww, wh,
                                          SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
@@ -4801,9 +4815,15 @@ static void vm_prepare(const Nv2aRawBatch *b)
  * its 4:3 width around an anchor by the box's centre: the left edge (left
  * quarter), the right edge (right quarter), else the centre - x' = A + (x - A) / k.
  * Only the ring copy of the vertices is changed, never the title's memory.
- * nv2a_vk_set_hud_squash(0, 0) or k <= 1: off. */
+ * nv2a_vk_set_hud_squash(0, 0) or k <= 1: off.
+ * nv2a_vk_set_hud_squash_edges(0) (THPS 2X v1.2.2: the ENTER NAME letter grid
+ * and the tournament score outline were torn apart, each draw anchored on its
+ * own): every squashed draw takes the centre - for a title's full-screen 2D
+ * screens drawn with the HUD program, which stay together; 1 (default) = the
+ * edge anchors above. */
 static volatile uint32_t s_sq_prog;
 static volatile float    s_sq_k;
+static volatile int      s_sq_edges = 1;
 static int   s_sq_on;                   /* this draw: squash attribute 0's x */
 static float s_sq_a, s_sq_kd;           /* this draw's anchor and k */
 
@@ -4811,6 +4831,11 @@ void nv2a_vk_set_hud_squash(uint32_t program_hash, double k)
 {
     s_sq_prog = program_hash;
     s_sq_k = k > 1.001 ? (float)k : 0.0f;
+}
+
+void nv2a_vk_set_hud_squash_edges(int on)
+{
+    s_sq_edges = on != 0;
 }
 
 static uint32_t vp_hash(const Nv2aRawBatch *b)
@@ -4866,7 +4891,7 @@ static int squash_decide(const Nv2aRawBatch *b)
          * grind balance meter's left end tick sits at x ~212, just inside the
          * left third, and was torn off the rest of the meter (centre). */
         float c = 0.5f * (x0 + x1);
-        s_sq_a = c < 640.0f / 4.0f ? 0.0f : c > 640.0f * 3.0f / 4.0f ? 640.0f : 320.0f;
+        s_sq_a = !s_sq_edges ? 320.0f : c < 640.0f / 4.0f ? 0.0f : c > 640.0f * 3.0f / 4.0f ? 640.0f : 320.0f;
     }
     s_sq_kd = k;
     return 1;
@@ -6608,6 +6633,271 @@ static VkSurf *smaa_run(VkSurf *s)
     return &s_smaa_img[2];
 }
 
+/* ── Display gamma (THPS 2X v1.2.2, GitHub #11: BRIGHTNESS) ──────────
+ * A display ramp (on the Xbox, D3D SetGammaRamp writes it into the NV2A's
+ * DAC palette, which applies it to everything the console scans out; here
+ * the NV2A registers are plain memory, so a port hands its ramp over with
+ * nv2a_vk_set_gamma_ramp - from
+ * the title's SetGammaRamp and / or its own brightness setting) as one
+ * 256-entry table, applied at the flip by a full-screen pass into a copy of
+ * the presented surface (like SMAA's), which the present then shows. The
+ * identity table costs nothing: no pass. RECOMP_VK_GAMMA=0: off. */
+static char     s_shot_gamma_path[340];         /* RECOMP_SHOT_GAMMA (test): the shot after the pass */
+static uint32_t s_shot_gamma_frame;
+static uint8_t  s_gam_ramp[256][3];
+static volatile uint32_t s_gam_ramp_gen;
+static int      s_gam_ramp_init;
+static volatile int s_gam_dirty = 1;
+static uint32_t s_gam_gen = 0xFFFFFFFFu;
+static int      s_gam_identity = 1, s_gam_bad;
+static uint8_t  s_gam_lut[256][4];
+static VkSurf   s_gam_img, s_gam_tex;
+static VkBuffer s_gam_buf;
+static VkDeviceMemory s_gam_mem;
+static void    *s_gam_map;
+static VkDescriptorSetLayout s_gam_dsl;
+static VkPipelineLayout s_gam_layout;
+static VkPipeline s_gam_pipe;
+static VkSampler  s_gam_point;
+
+void nv2a_vk_set_gamma_ramp(const uint8_t red[256], const uint8_t green[256], const uint8_t blue[256])
+{
+    int i;
+    for (i = 0; i < 256; i++) {
+        s_gam_ramp[i][0] = red[i];
+        s_gam_ramp[i][1] = green[i];
+        s_gam_ramp[i][2] = blue[i];
+    }
+    s_gam_ramp_init = 1;
+    s_gam_ramp_gen++;
+}
+
+/* the table from the ramp set last (none yet: the identity); 1 if it changed */
+static int gamma_table(void)
+{
+    uint32_t gen = s_gam_ramp_gen;
+    int i, c, id = 1;
+    if (gen == s_gam_gen && !s_gam_dirty)
+        return 0;
+    s_gam_gen = gen;
+    s_gam_dirty = 0;
+    for (i = 0; i < 256; i++) {
+        for (c = 0; c < 3; c++) {
+            s_gam_lut[i][c] = s_gam_ramp_init ? s_gam_ramp[i][c] : (uint8_t)i;
+            id &= s_gam_lut[i][c] == i;
+        }
+        s_gam_lut[i][3] = 255;
+    }
+    if (id != s_gam_identity || !id)
+        LOGE("gamma: %s (entry 64/128/192 = %u/%u/%u)\n", id ? "identity" : "applied", s_gam_lut[64][1],
+             s_gam_lut[128][1], s_gam_lut[192][1]);
+    s_gam_identity = id;
+    return 1;
+}
+
+static int gamma_setup(void)
+{
+    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkMemoryRequirements rq;
+    VkGraphicsPipelineCreateInfo ci = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    VkPipelineShaderStageCreateInfo st[2];
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    VkPipelineColorBlendAttachmentState ba;
+    VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    VkPipelineRenderingCreateInfo rci = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkShaderModule vs, fs;
+    int i;
+    if (s_gam_pipe)
+        return 1;
+    for (i = 0; i < 2; i++) {
+        b[i].binding = (uint32_t)i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        b[i].pImmutableSamplers = NULL;
+    }
+    lci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    lci.bindingCount = 2;
+    lci.pBindings = b;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &s_gam_dsl;
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateDescriptorSetLayout(s_dev, &lci, NULL, &s_gam_dsl) != VK_SUCCESS
+        || vkCreatePipelineLayout(s_dev, &pli, NULL, &s_gam_layout) != VK_SUCCESS
+        || vkCreateSampler(s_dev, &sci, NULL, &s_gam_point) != VK_SUCCESS)
+        return 0;
+    /* the table: a 256x1 image, filled from a host-visible buffer kept for the run */
+    if (!make_image(256, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, &s_gam_tex.image, &s_gam_tex.view, &s_gam_tex.mem))
+        return 0;
+    s_gam_tex.pw = 256; s_gam_tex.ph = 1;
+    bci.size = sizeof s_gam_lut;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(s_dev, &bci, NULL, &s_gam_buf) != VK_SUCCESS)
+        return 0;
+    vkGetBufferMemoryRequirements(s_dev, s_gam_buf, &rq);
+    if (!(s_gam_mem = alloc_mem(rq, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        || vkBindBufferMemory(s_dev, s_gam_buf, s_gam_mem, 0) != VK_SUCCESS
+        || vkMapMemory(s_dev, s_gam_mem, 0, sizeof s_gam_lut, 0, &s_gam_map) != VK_SUCCESS)
+        return 0;
+    vs = compile(GLSLANG_STAGE_VERTEX, s_pp_vs);
+    fs = compile(GLSLANG_STAGE_FRAGMENT,
+        "#version 450\n"
+        "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+        "layout(set = 0, binding = 1) uniform sampler2D lut;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "float g(float v, int c) { return texelFetch(lut, ivec2(int(v * 255.0 + 0.5), 0), 0)[c]; }\n"
+        "void main() {\n"
+        "    vec4 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0);\n"
+        "    o = vec4(g(c.r, 0), g(c.g, 1), g(c.b, 2), c.a);\n"
+        "}\n");
+    if (vs && fs) {
+        memset(st, 0, sizeof st);
+        st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        st[0].module = vs;
+        st[0].pName = "main";
+        st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        st[1].module = fs;
+        st[1].pName = "main";
+        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        vps.viewportCount = vps.scissorCount = 1;
+        rs.polygonMode = VK_POLYGON_MODE_FILL;
+        rs.lineWidth = 1.0f;
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        memset(&ba, 0, sizeof ba);
+        ba.colorWriteMask = 0xF;
+        cb.attachmentCount = 1;
+        cb.pAttachments = &ba;
+        dy.dynamicStateCount = 2;
+        dy.pDynamicStates = dyn;
+        rci.colorAttachmentCount = 1;
+        rci.pColorAttachmentFormats = &fmt;
+        ci.pNext = &rci;
+        ci.stageCount = 2;
+        ci.pStages = st;
+        ci.pVertexInputState = &vi;
+        ci.pInputAssemblyState = &ia;
+        ci.pViewportState = &vps;
+        ci.pRasterizationState = &rs;
+        ci.pMultisampleState = &ms;
+        ci.pColorBlendState = &cb;
+        ci.pDynamicState = &dy;
+        ci.layout = s_gam_layout;
+        if (vkCreateGraphicsPipelines(s_dev, s_pcache, 1, &ci, NULL, &s_gam_pipe) != VK_SUCCESS)
+            s_gam_pipe = VK_NULL_HANDLE;
+    }
+    if (vs) vkDestroyShaderModule(s_dev, vs, NULL);
+    if (fs) vkDestroyShaderModule(s_dev, fs, NULL);
+    return s_gam_pipe != VK_NULL_HANDLE;
+}
+
+/* Surface s through the gamma table; the copy (at s's size) to present
+ * instead, or NULL (identity table, off, or a failure: the plain present).
+ * Outside rendering. */
+static VkSurf *gamma_run(VkSurf *s)
+{
+    static int env = -1;
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkViewport vp;
+    VkRect2D sc;
+    VkDescriptorImageInfo ii[2];
+    VkWriteDescriptorSet wr[2];
+    int changed, i;
+    if (env < 0) {
+        const char *e = getenv("RECOMP_VK_GAMMA");
+        env = !(e && *e == '0');
+    }
+    if (!env || s_gam_bad || !s || !s->view)
+        return NULL;
+    changed = gamma_table();
+    if (s_gam_identity)
+        return NULL;
+    end_rendering();
+    if (!gamma_setup()) {
+        LOGE("gamma pass could not be set up -- presenting without the gamma ramp\n");
+        s_gam_bad = 1;
+        return NULL;
+    }
+    if (changed || s_gam_tex.pw != 257) {          /* the table to the image (pw 257 = uploaded once) */
+        VkBufferImageCopy rg;
+        memcpy(s_gam_map, s_gam_lut, sizeof s_gam_lut);
+        barrier_all();
+        memset(&rg, 0, sizeof rg);
+        rg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rg.imageSubresource.layerCount = 1;
+        rg.imageExtent.width = 256;
+        rg.imageExtent.height = 1;
+        rg.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(s_cb, s_gam_buf, s_gam_tex.image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+        barrier_all();
+        s_gam_tex.pw = 257;
+    }
+    if (s_gam_img.image && (s_gam_img.pw != s->pw || s_gam_img.ph != s->ph)) {
+        garbage_add(s_gam_img.image, s_gam_img.view, s_gam_img.mem);
+        memset(&s_gam_img, 0, sizeof s_gam_img);
+    }
+    if (!s_gam_img.image) {
+        if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_gam_img.image, &s_gam_img.view, &s_gam_img.mem)) {
+            static uint32_t told_w, told_h;
+            if (told_w != s->pw || told_h != s->ph)
+                LOGE("gamma: %ux%u image failed to allocate -- presented without the gamma ramp\n", s->pw, s->ph);
+            told_w = s->pw; told_h = s->ph;
+            memset(&s_gam_img, 0, sizeof s_gam_img);
+            return NULL;
+        }
+        s_gam_img.pw = s->pw; s_gam_img.ph = s->ph;
+    }
+    vp.x = vp.y = 0.0f; vp.width = (float)s->pw; vp.height = (float)s->ph; vp.minDepth = 0.0f; vp.maxDepth = 1.0f;
+    sc.offset.x = sc.offset.y = 0; sc.extent.width = s->pw; sc.extent.height = s->ph;
+    ca.imageView = s_gam_img.view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.renderArea.extent.width = s->pw;
+    ri.renderArea.extent.height = s->ph;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    p_begin_rendering(s_cb, &ri);
+    vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_gam_pipe);
+    vkCmdSetViewport(s_cb, 0, 1, &vp);
+    vkCmdSetScissor(s_cb, 0, 1, &sc);
+    for (i = 0; i < 2; i++) {
+        ii[i].sampler = s_gam_point;
+        ii[i].imageView = i ? s_gam_tex.view : s->view;
+        ii[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        memset(&wr[i], 0, sizeof wr[i]);
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstBinding = (uint32_t)i;
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[i].pImageInfo = &ii[i];
+    }
+    p_push_desc(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_gam_layout, 0, 2, wr);
+    vkCmdDraw(s_cb, 3, 1, 0, 0);
+    p_end_rendering(s_cb);
+    barrier_all();
+    s_dyn_valid = 0;
+    s_pipe_foreign = 1;                            /* the next draw rebinds its own */
+    return &s_gam_img;
+}
+
 /* ── MSAA (ANTIALIASING = MSAA 2X / 4X) ───────────────────────────────
  * The presented surface only (maintainer, 2026-10-26) and its depth: at the
  * flip it gets a multisampled image of the chosen count (ms_flip), filled
@@ -7033,6 +7323,10 @@ static void vk_flip(void)
         s_shot_pending = 0;
         dump_surface(s, path);
         fprintf(stderr, "[VK] screenshot %s (frame %u)\n", path, s_frame);
+        /* RECOMP_SHOT_GAMMA=1 (test): also the picture after the gamma pass */
+        snprintf(s_shot_gamma_path, sizeof s_shot_gamma_path, "%s%s_gamma.bmp", pre && *pre ? pre : "shot_",
+                 s_shot_name);
+        s_shot_gamma_frame = s_frame + 1;
     }
     if (s && s_drew_any && dump_every && ((s_frame % (uint32_t)dump_every) == 0
                                           || (s_inst_alt && s_frame % (uint32_t)dump_every == 1))) {
@@ -7082,6 +7376,26 @@ static void vk_flip(void)
         pres = smaa_run(s);
     if (!pres)
         pres = s;
+    /* the title's gamma ramp + the user gamma (THPS 2X v1.2.2): a copy of pres
+     * through the table, presented in its place; identity = no pass */
+    if (pres && !s_headless) {
+        VkSurf *g = gamma_run(pres);
+        if (g)
+            pres = g;
+        if (s_shot_gamma_frame == s_frame + 1) {
+            static int env = -1;
+            if (env < 0) {
+                const char *e = getenv("RECOMP_SHOT_GAMMA");
+                env = e && *e == '1';
+            }
+            s_shot_gamma_frame = 0;
+            if (env && g) {
+                barrier_all();
+                dump_surface(g, s_shot_gamma_path);
+                fprintf(stderr, "[VK] screenshot %s (after the gamma pass)\n", s_shot_gamma_path);
+            }
+        }
+    }
     {
         /* SHADERS: a preset asked for is built / put in place / dropped here,
          * before the image is acquired (a swap waits for the device) */
@@ -7137,7 +7451,7 @@ static void vk_flip(void)
             if (dw > 0 && dh > 0
                 && ((shader && present_shader(pres, dst, dx, dy, dw, dh))
                     || (fxaa_on()
-                        && present_fxaa(s, dst, s_sc_views[idx], s_sc_format, s_sc_extent, dx, dy, dw, dh,
+                        && present_fxaa(pres, dst, s_sc_views[idx], s_sc_format, s_sc_extent, dx, dy, dw, dh,
                                         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)))) {
                 if (hud_on()) {

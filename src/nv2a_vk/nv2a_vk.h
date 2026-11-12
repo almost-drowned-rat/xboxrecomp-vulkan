@@ -76,6 +76,17 @@ void nv2a_vk_set_stretch_43(int on);
  * (aspect / (4/3)) around the left edge, the centre or the right edge. Any
  * thread; per frame. k <= 1 or hash 0: off. */
 void nv2a_vk_set_hud_squash(uint32_t program_hash, double k);
+/* 1 (default): squashed draws anchor by quarters (left edge / centre / right
+ * edge); 0: all at the centre - for full-screen 2D screens the title draws
+ * with its HUD program (menus over gameplay, name entry), kept together. */
+void nv2a_vk_set_hud_squash_edges(int on);
+/* Display gamma (THPS 2X v1.2.2): the title's
+ * gamma ramp (Xbox D3D SetGammaRamp -> the DAC palette; the port passes the
+ * three 256-entry tables, as the NV2A registers are plain memory here - a
+ * port's own brightness goes into the tables it passes). A full-screen pass
+ * at the flip, none while the ramp is the identity. Any thread;
+ * RECOMP_VK_GAMMA=0 turns the pass off. */
+void nv2a_vk_set_gamma_ramp(const uint8_t r[256], const uint8_t g[256], const uint8_t b[256]);
 
 /* ANTIALIASING (porting_guide.md M6): OFF, FXAA (the present pass, the default
  * -- the picture as before the option), SMAA (iryoku/smaa, three passes at the

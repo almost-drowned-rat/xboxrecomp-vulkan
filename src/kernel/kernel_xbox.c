@@ -204,23 +204,57 @@ void (*volatile g_xbox_nv2a_idle_hook)(void) = NULL;
 
 /* The gameplay aspect ratio (THPS 2X maintainer, 2026-11-07: 16:10 and 21:9
  * next to 4:3 / 16:9; every port): RECOMP_WIDESCREEN unset / 0 = 4:3, 1 or
- * 16:9, 16:10, 21:9 (= 64:27, the 2560x1080 / 5120x2160 panels; 3440x1440 is
- * 43:18, under 1 % narrower). */
+ * 16:9, 16:10, 21:9 (= 64:27, the 2560x1080 / 5120x2160 panels).
+ * 21:9 = the display's exact ratio (THPS 2X maintainer, 2026-11-08; every
+ * port): 21:9 panels differ (3440x1440 is 43:18 = 2.389, 3840x1600 2.4), and
+ * a fixed 64:27 left a few columns of black bars on them. The back end tells
+ * the display's ratio before its window opens (xbox_video_aspect_fit); a ratio
+ * in XBOX_ASPECT_21_MIN..MAX replaces 64:27, any other (a 16:9 desktop) keeps
+ * it. RECOMP_DISPLAY_RATIO=<w>x<h> or <ratio> stands in for the display (tests). */
+#define XBOX_ASPECT_21_MIN 2.30
+#define XBOX_ASPECT_21_MAX 2.42
+static double s_video_aspect = 0.0;
+static int s_video_aspect_21;                     /* 21:9 chosen: the ratio may follow the display */
+void xbox_video_aspect_fit(double display_ratio);
+
 double xbox_video_aspect(void)
 {
-    static double a = 0.0;
-    if (a == 0.0) {
+    if (s_video_aspect == 0.0) {
         const char *e = getenv("RECOMP_WIDESCREEN");
         if (!e || !*e || !strcmp(e, "0") || !strcmp(e, "4:3"))
-            a = 4.0 / 3.0;
+            s_video_aspect = 4.0 / 3.0;
         else if (!strcmp(e, "16:10"))
-            a = 16.0 / 10.0;
-        else if (!strcmp(e, "21:9"))
-            a = 64.0 / 27.0;
-        else
-            a = 16.0 / 9.0;                       /* "1", "16:9" */
+            s_video_aspect = 16.0 / 10.0;
+        else if (!strcmp(e, "21:9")) {
+            s_video_aspect = 64.0 / 27.0;
+            s_video_aspect_21 = 1;
+            if ((e = getenv("RECOMP_DISPLAY_RATIO")) != NULL && *e) {
+                double w = strtod(e, NULL), h = 1.0;
+                const char *x = strpbrk(e, "xX:");
+                if (x)
+                    h = strtod(x + 1, NULL);
+                if (w > 0.0 && h > 0.0)
+                    xbox_video_aspect_fit(w / h);
+            }
+        } else
+            s_video_aspect = 16.0 / 9.0;          /* "1", "16:9" */
     }
-    return a;
+    return s_video_aspect;
+}
+
+void xbox_video_aspect_fit(double display_ratio)
+{
+    static int fitted;
+    (void)xbox_video_aspect();                    /* the choice first */
+    if (!s_video_aspect_21 || fitted)
+        return;                                   /* the first call wins: RECOMP_DISPLAY_RATIO, then the display */
+    fitted = 1;
+    if (display_ratio >= XBOX_ASPECT_21_MIN && display_ratio <= XBOX_ASPECT_21_MAX) {
+        s_video_aspect = display_ratio;
+        fprintf(stderr, "  [video] 21:9 = the display's %.4f (64:27 = 2.3704)\n", display_ratio);
+    } else {
+        fprintf(stderr, "  [video] 21:9 stays 64:27 (display %.4f is no 21:9 panel)\n", display_ratio);
+    }
 }
 
 int xbox_video_widescreen(void)
