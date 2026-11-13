@@ -658,6 +658,11 @@ typedef struct {
      * none. Only the presented surface gets one. */
     VkImage ms_image; VkImageView ms_view; VkDeviceMemory ms_mem;
     uint32_t ms;
+    /* had one until a resize made the surface again: ms_flip gives it back
+     * (THPS 2X GitHub #17 - its scene target, presented in the menus, changes
+     * its width when a level starts at 16:9 / 16:10 and was never presented
+     * again, so the level ran without MSAA) */
+    uint32_t ms_again;
 } VkSurf;
 
 /* the boot animation's frame (nv2a_vk_boot_frame): presented in place of a
@@ -792,6 +797,10 @@ static uint32_t to_stored(uint32_t v, uint32_t p, uint32_t l)
     return (uint32_t)(((uint64_t)v * p + l / 2) / l);
 }
 static VkSurf     s_surf[VK_MAX_SURF];
+/* RECOMP_VK_RT_STATS=<N> (diagnostic, THPS 2X GitHub #17 MSAA): every N-th
+ * flip lists the surfaces drawn into since the last one - va, size, sample
+ * count, draws - and which one is presented */
+static uint32_t   s_rt_draws[VK_MAX_SURF];
 static VkDepthBuf s_depth[VK_MAX_DEPTH];
 
 /* ── Render scale: what fits the device ─────────────────────────────── */
@@ -1336,7 +1345,8 @@ static void rescale_surfaces(double k)
         vkCmdBlitImage(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, img,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
         garbage_add(s->image, s->view, s->mem);
-        ms_drop(s);                     /* MSAA: made again at the new size at the next flip */
+        s->ms_again = s->ms;            /* MSAA: made again at the new size at the next flip */
+        ms_drop(s);
         s->image = img; s->view = view; s->mem = mem;
         s->pw = pw; s->ph = ph;
         s->gen++;                       /* cube maps built from it refill */
@@ -4890,8 +4900,18 @@ static int squash_decide(const Nv2aRawBatch *b)
          * the centre. Quarters, not thirds (THPS 2X GitHub #10, v1.2.1): the
          * grind balance meter's left end tick sits at x ~212, just inside the
          * left third, and was torn off the rest of the meter (centre). */
+        /* A box that starts in the left quarter (ends in the right quarter) and
+         * is not centred keeps that edge too (THPS 2X GitHub #11, v1.2.3): a
+         * left-aligned text block - the yellow tips at a level's start - has
+         * short lines (centre in the left quarter) and long ones (centre past
+         * it); "TIP: / PRESS A AT / IMPACT TO / LAND BIG DROPS" at 16:10 had its
+         * last line pulled toward the middle. Centred boxes (centre within 24
+         * px of 320) stay centred. */
         float c = 0.5f * (x0 + x1);
-        s_sq_a = !s_sq_edges ? 320.0f : c < 640.0f / 4.0f ? 0.0f : c > 640.0f * 3.0f / 4.0f ? 640.0f : 320.0f;
+        int centred = c > 296.0f && c < 344.0f;
+        s_sq_a = !s_sq_edges ? 320.0f
+               : c < 640.0f / 4.0f || (x0 < 640.0f / 4.0f && !centred) ? 0.0f
+               : c > 640.0f * 3.0f / 4.0f || (x1 > 640.0f * 3.0f / 4.0f && !centred) ? 640.0f : 320.0f;
     }
     s_sq_kd = k;
     return 1;
@@ -5457,6 +5477,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     begin_rendering(s, d);
     s->dirty = 1;
     s->gen++;
+    s_rt_draws[s - s_surf]++;               /* RECOMP_VK_RT_STATS */
     if (pipe != cur_pipe || cur_pipe_gen != s_cb_gen || s_pipe_foreign) {
         vkCmdBindPipeline(s_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         cur_pipe = pipe;
@@ -7066,10 +7087,23 @@ static void ms_flip(VkSurf *s)
         VkSurf *x = &s_surf[k];
         if (x->image && x->ms && x->ms != n)
             ms_drop(x);                         /* another count, or off */
+        if (!n)
+            x->ms_again = 0;
     }
     if (!n) {
         s_ms_good = 0;
         return;
+    }
+    for (k = 0; k < VK_MAX_SURF; k++) {
+        VkSurf *x = &s_surf[k];
+        if (!x->ms_again || !x->image || x == s || x->ms)
+            continue;
+        x->ms_again = 0;                        /* resized: its MSAA back (once; a failure stays off) */
+        if (ms_set(x, n))
+            LOGE("MSAA %ux: surface 0x%08X %ux%u (again after a resize)\n", n, x->va, x->pw, x->ph);
+        else
+            LOGE("MSAA %ux: surface 0x%08X %ux%u failed to allocate after a resize -- it stays without\n",
+                 n, x->va, x->pw, x->ph);
     }
     if (!s || !s->image)
         return;
@@ -7367,6 +7401,23 @@ static void vk_flip(void)
         }
     }
     barrier_all();
+    {
+        static long every = -2;
+        int k;
+        if (every == -2) {
+            const char *e = getenv("RECOMP_VK_RT_STATS");
+            every = e && *e ? atol(e) : 0;
+        }
+        if (every > 0 && s_frame % (uint32_t)every == 0) {
+            fprintf(stderr, "[RT] f %u presented %08X:", s_frame, s ? s->va : 0u);
+            for (k = 0; k < VK_MAX_SURF; k++)
+                if (s_rt_draws[k] && s_surf[k].image)
+                    fprintf(stderr, " %08X %ux%u ms%u draws %u;", s_surf[k].va, s_surf[k].pw, s_surf[k].ph,
+                            s_surf[k].ms, s_rt_draws[k]);
+            fprintf(stderr, "\n");
+        }
+        memset(s_rt_draws, 0, sizeof s_rt_draws);
+    }
     /* ANTIALIASING = MSAA: the presented surface's multisampled image, made
      * or dropped here for the next frame's passes */
     ms_flip(s);
