@@ -177,6 +177,9 @@ static volatile int s_shot_pending;
 static SDL_Window    *s_win;
 static SDL_ThreadID   s_win_thread;     /* the NV2A thread, which made s_win */
 #endif
+/* The NV2A thread's idle pass (kernel.h): boot animation + window events. */
+extern void (*volatile g_xbox_nv2a_idle_hook)(void);
+static void nv2a_idle(void);
 static volatile float s_display_hz;     /* nv2a_vk_display_hz; 0 = not known */
 
 float nv2a_vk_display_hz(void)
@@ -3791,6 +3794,8 @@ static int ready(void)
                     vk_fatal(w);
                 } else {
                     int r[4] = { s_wr_want[0], s_wr_want[1], ww, wh };
+                    if (!g_xbox_nv2a_idle_hook)        /* events also without flips (THPS 2X #19) */
+                        g_xbox_nv2a_idle_hook = nv2a_idle;
                     if (!SDL_SetWindowAspectRatio(s_win, aspect, aspect))
                         LOGE("SDL_SetWindowAspectRatio: %s\n", SDL_GetError());
                     {
@@ -7125,6 +7130,8 @@ int nv2a_vk_antialiasing_fits(int mode)
     return !n || !s_state || ((s_ms_max & n) && !(s_ms_bad & n));    /* before the device: 1 */
 }
 
+static void win_events(int at_flip);
+
 static void vk_flip(void)
 {
     static int dump_every = -1;
@@ -7682,6 +7689,23 @@ static void vk_flip(void)
     frame_begin();
     VT("flip %u: next frame recording\n", s_frame);
     s_dyn_valid = 0;
+    win_events(1);
+}
+
+/* The window's events: at every flip, and from the NV2A thread's idle pass
+ * (nv2a_idle) when no flip came for EV_IDLE_NS. SDL reads the keyboard, the
+ * host pads (SDL_GetGamepadButton) and the window's messages only when they
+ * are pumped, so a title that waits for a button without drawing -- THPS 2X's
+ * Park Editor tips screen spins on the pad and the clock and never flips --
+ * saw no press at all and Windows marked the window "not responding" (THPS 2X
+ * #19). Scripted input never noticed: it is applied in xbox_InputGetState.
+ * at_flip = 0 leaves the display mode alone (dm_apply re-makes the swapchain;
+ * that waits for the next flip). */
+#define EV_IDLE_NS 50000000ull
+static uint64_t s_ev_last_ns;        /* NV2A thread only */
+
+static void win_events(int at_flip)
+{
 #if !defined(__SWITCH__)
     if (s_win) {
         SDL_Event e;
@@ -7692,6 +7716,7 @@ static void vk_flip(void)
         static int cur_init, cur_shown;
         static uint64_t cur_idle_ns, cur_moved;
         uint64_t now_c = hz_now();
+        s_ev_last_ns = now_c;
         if (!cur_init) {
             const char *ev = getenv("RECOMP_CURSOR_IDLE_MS");
             cur_init = 1;
@@ -7742,8 +7767,11 @@ static void vk_flip(void)
             SDL_HideCursor();
             cur_shown = 0;
         }
-        dm_apply();                                /* a DISPLAY MODE change from the port */
+        if (at_flip)
+            dm_apply();                            /* a DISPLAY MODE change from the port */
     }
+#else
+    (void)at_flip;
 #endif
 }
 
@@ -7865,8 +7893,7 @@ static void boot_idle(void)
         }
         memset(&s_boot, 0, sizeof s_boot);
         s_boot_on = 0;
-        g_xbox_nv2a_idle_hook = NULL;
-        SDL_SetAtomicInt(&s_bv_state, 0);
+        SDL_SetAtomicInt(&s_bv_state, 0);           /* the hook stays: nv2a_idle */
         return;
     }
     if (no_window || !ready() || s_headless) {
@@ -7888,13 +7915,36 @@ static void boot_idle(void)
     vk_flip();
 }
 
+/* NV2A thread, once per pass of its loop (g_xbox_nv2a_idle_hook, ~1 ms): the
+ * boot animation while it runs, then the window's events when no flip pumped
+ * them for EV_IDLE_NS (win_events). Installed when the window is made.
+ * RECOMP_VK_IDLE_EVENTS=0: events only at the flips, as before. */
+static void nv2a_idle(void)
+{
+    static int on = -1;
+    if (SDL_GetAtomicInt(&s_bv_state))
+        boot_idle();
+#if !defined(__SWITCH__)
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_IDLE_EVENTS");
+        on = !(e && *e == '0');
+    }
+    if (!on || !s_win || s_headless || s_win_thread != SDL_GetCurrentThreadID())
+        return;
+    if (hz_now() - s_ev_last_ns >= EV_IDLE_NS)
+        win_events(0);
+#else
+    (void)on;
+#endif
+}
+
 int nv2a_vk_boot_begin(void)
 {
     if (!s_bv_mx && !(s_bv_mx = SDL_CreateMutex()))
         return 0;
     SDL_SetAtomicInt(&s_bv_skip, 0);
     SDL_SetAtomicInt(&s_bv_state, 1);
-    g_xbox_nv2a_idle_hook = boot_idle;
+    g_xbox_nv2a_idle_hook = nv2a_idle;
     return 1;
 }
 
