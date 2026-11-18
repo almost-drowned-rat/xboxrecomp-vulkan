@@ -4226,6 +4226,50 @@ static void flip_apply_retired(void)
                         : s_gpu.flip_read + 1;
 }
 
+/* Where the window gets the frame: at FLIP_INCREMENT_WRITE (default) or at
+ * FLIP_STALL (RECOMP_PRESENT_AT=stall, the behaviour up to v1.2.7).
+ * D3D's swap writes STALL first (wait until the buffer to draw into is no
+ * longer shown), then draws into the new front buffer - with antialiasing
+ * the filter copy of the scene, THPS 2X's one draw into 0x80E68000 /
+ * 0x80D3C000 - and only then INCREMENT_WRITE: that buffer is shown from the
+ * next vblank. Presenting at the STALL showed the buffer before the copy, the
+ * previous frame: one frame of extra latency always, and a screen drawn once
+ * and then waited on never appeared (THPS 2X #19, the Park Editor tips:
+ * drawn, swapped, then a busy-wait for A - the window kept the main menu). */
+static int present_at_increment(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_PRESENT_AT");
+        v = !(e && !strcmp(e, "stall"));
+    }
+    return v;
+}
+
+/* Show the frame just finished: the surface the last batch drew into (by the
+ * flip color_offset has already moved on). Following clears instead showed
+ * whatever offscreen target was cleared last -- X-Men Legends' font/icon
+ * atlas. The window gets a copy, so it never shows a surface the rasteriser is
+ * still writing. */
+static void pb_present(void)
+{
+    if (s_gpu.drawn_offset || s_gpu.color_offset) {
+        extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+        uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                           : s_gpu.color_offset;
+        uint32_t pitch = s_gpu.drawn_offset && s_gpu.drawn_pitch
+                       ? s_gpu.drawn_pitch : s_gpu.pitch;
+        if (s_gpu.drawn_offset)
+            s_gpu.flip_seen = 1;
+        if (pitch) {
+            xbox_FramebufferWindowSet(dma_resolve(done), pitch);
+            xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
+        }
+    }
+    if (s_backend && s_backend->flip)
+        s_backend->flip();
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -4536,6 +4580,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * still leaves one. */
         if ((pb_verbose() || pb_report()) && s_gpu.flips % 600 == 0)
             nv2a_pb_exec_report();
+        if (present_at_increment())
+            pb_present();
         return;
 
     case NV097_FLIP_STALL:
@@ -4597,26 +4643,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
-        /* Show the frame just finished: the surface the last batch drew
-         * into (by the flip color_offset has already moved on). Following
-         * clears instead showed whatever offscreen target was cleared last
-         * -- X-Men Legends' font/icon atlas. The window gets a copy, so it
-         * never shows a surface the rasteriser is still writing. */
-        if (s_gpu.drawn_offset || s_gpu.color_offset) {
-            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
-            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                               : s_gpu.color_offset;
-            uint32_t pitch = s_gpu.drawn_offset && s_gpu.drawn_pitch
-                           ? s_gpu.drawn_pitch : s_gpu.pitch;
-            if (s_gpu.drawn_offset)
-                s_gpu.flip_seen = 1;
-            if (pitch) {
-                xbox_FramebufferWindowSet(dma_resolve(done), pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), pitch);
-            }
-        }
-        if (s_backend && s_backend->flip)
-            s_backend->flip();
+        if (!present_at_increment())
+            pb_present();
         if (pb_verbose()) {
             static unsigned n;
             if (n++ < 8) {
